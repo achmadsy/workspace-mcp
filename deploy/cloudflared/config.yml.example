@@ -1,0 +1,10 @@
+# ~/.cloudflared/config.yml  (named tunnel; copy and fill in)
+# Tunnel UUID and credentials file are printed by `cloudflared tunnel create`.
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/YOURUSER/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  # The hostname you routed with: cloudflared tunnel route dns <tunnel> mcp.example.com
+  - hostname: mcp.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404

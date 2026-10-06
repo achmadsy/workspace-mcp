@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare Tunnel for Workspace MCP (named tunnel)
+After=network.target workspace-mcp.service
+
+[Service]
+Type=simple
+# Requires a named tunnel configured per README ("Named Tunnel"):
+#   cloudflared tunnel login
+#   cloudflared tunnel create workspace-mcp
+#   cloudflared tunnel route dns workspace-mcp mcp.example.com
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run workspace-mcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
