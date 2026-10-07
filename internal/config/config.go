@@ -8,9 +8,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
+
+	"github.com/link/workspace-mcp/internal/limits"
 )
 
 type Mode string
@@ -21,15 +26,37 @@ const (
 )
 
 type Config struct {
-	WorkspaceRoot string
-	Host          string
-	Port          int
-	Mode          Mode
-	PublicURL     string
-	AdminPassword string
-	StateDir      string
-	StateKey      [32]byte
-	TrustTunnel   bool
+	WorkspaceRoot  string
+	Host           string
+	Port           int
+	Mode           Mode
+	PublicURL      string
+	AdminPassword  string
+	StateDir       string
+	StateKey       [32]byte
+	TrustTunnel    bool
+	AllowedOrigins []string
+
+	EnableExec       bool
+	EnableGitWrite   bool
+	EnableGitNetwork bool
+	BwrapPath        string
+	Slirp4netnsPath  string
+	SystemdRunPath   string
+	ExecTimeout      time.Duration
+	ExecJobTimeout   time.Duration
+	ExecJobTTL       time.Duration
+	ExecMaxOutput    int
+	ExecMaxJobs      int
+	ExecMemoryBytes  uint64
+	ExecCPUSeconds   uint64
+	ExecMaxProcesses uint64
+	ExecMaxOpenFiles uint64
+
+	GitCredentialMode string
+	GitCredentialFile string
+	GitKnownHostsFile string
+	GitAllowedRemotes []string
 }
 
 func Load() (Config, error) {
@@ -41,6 +68,37 @@ func Load() (Config, error) {
 	c.AdminPassword = os.Getenv("MCP_ADMIN_PASSWORD")
 	c.StateDir = strings.TrimSpace(os.Getenv("MCP_STATE_DIR"))
 	c.TrustTunnel = envBool("MCP_TRUST_CLOUDFLARE_TUNNEL")
+	c.EnableExec = envBool("MCP_ENABLE_EXEC")
+	c.EnableGitWrite = envBool("MCP_ENABLE_GIT_WRITE")
+	c.EnableGitNetwork = envBool("MCP_ENABLE_GIT_NETWORK")
+	c.ExecTimeout = envDuration("MCP_EXEC_TIMEOUT", limits.ExecTimeout)
+	c.ExecJobTimeout = envDuration("MCP_EXEC_JOB_TIMEOUT", limits.ExecJobTimeout)
+	c.ExecJobTTL = envDuration("MCP_EXEC_JOB_TTL", limits.ExecJobTTL)
+	c.ExecMaxOutput = envInt("MCP_EXEC_MAX_OUTPUT", limits.MaxExecOutput)
+	c.ExecMaxJobs = envInt("MCP_EXEC_MAX_JOBS", limits.MaxExecJobs)
+	c.ExecMemoryBytes = uint64(envInt64("MCP_EXEC_MEMORY_BYTES", 1<<30))
+	c.ExecCPUSeconds = uint64(envInt64("MCP_EXEC_CPU_SECONDS", 300))
+	c.ExecMaxProcesses = uint64(envInt64("MCP_EXEC_MAX_PROCESSES", 128))
+	c.ExecMaxOpenFiles = uint64(envInt64("MCP_EXEC_MAX_OPEN_FILES", 1024))
+	c.GitCredentialMode = envDefault("MCP_GIT_CREDENTIAL_MODE", "none")
+	c.GitCredentialFile = strings.TrimSpace(os.Getenv("MCP_GIT_CREDENTIAL_FILE"))
+	c.GitKnownHostsFile = strings.TrimSpace(os.Getenv("MCP_GIT_KNOWN_HOSTS_FILE"))
+	for _, remote := range strings.Split(envDefault("MCP_GIT_ALLOWED_REMOTES", "origin"), ",") {
+		if remote = strings.TrimSpace(remote); remote != "" {
+			c.GitAllowedRemotes = append(c.GitAllowedRemotes, remote)
+		}
+	}
+	// Remote MCP clients (Claude.ai connectors) call /mcp server-side with
+	// their own Origin header; allow-list them instead of rejecting 403.
+	c.AllowedOrigins = []string{"https://claude.ai", "https://claude.com"}
+	if raw := strings.TrimSpace(os.Getenv("MCP_ALLOWED_ORIGINS")); raw != "" {
+		c.AllowedOrigins = nil
+		for _, part := range strings.Split(raw, ",") {
+			if origin := strings.TrimSpace(part); origin != "" {
+				c.AllowedOrigins = append(c.AllowedOrigins, strings.TrimRight(origin, "/"))
+			}
+		}
+	}
 	port, err := strconv.Atoi(envDefault("MCP_PORT", "8787"))
 	if err != nil || port < 1 || port > 65535 {
 		return Config{}, errors.New("MCP_PORT must be an integer from 1 to 65535")
@@ -59,6 +117,9 @@ func Load() (Config, error) {
 	}
 	if c.Mode != ModeLocal && c.Mode != ModePublic {
 		return Config{}, errors.New("MCP_MODE must be local or public")
+	}
+	if err := c.validateAgentic(); err != nil {
+		return Config{}, err
 	}
 	if c.Mode == ModeLocal {
 		if !isLoopback(c.Host) {
@@ -104,5 +165,97 @@ func envDefault(k, d string) string {
 	}
 	return d
 }
-func envBool(k string) bool       { v, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(k))); return v }
+func envBool(k string) bool { v, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(k))); return v }
+func envInt(k string, d int) int {
+	v, err := strconv.Atoi(envDefault(k, strconv.Itoa(d)))
+	if err != nil {
+		return -1
+	}
+	return v
+}
+func envInt64(k string, d int64) int64 {
+	v, err := strconv.ParseInt(envDefault(k, strconv.FormatInt(d, 10)), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return v
+}
+func envDuration(k string, d time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return d
+	}
+	parsed, err := time.ParseDuration(v)
+	if err != nil {
+		return -1
+	}
+	return parsed
+}
 func isLoopback(host string) bool { ip := net.ParseIP(host); return ip != nil && ip.IsLoopback() }
+
+func (c *Config) validateAgentic() error {
+	if c.EnableGitNetwork && !c.EnableGitWrite {
+		return errors.New("MCP_ENABLE_GIT_NETWORK requires MCP_ENABLE_GIT_WRITE")
+	}
+	if c.ExecTimeout <= 0 || c.ExecTimeout >= limits.HTTPTimeout || c.ExecJobTimeout <= 0 || c.ExecJobTTL <= 0 {
+		return errors.New("execution timeouts must be positive and MCP_EXEC_TIMEOUT must be shorter than HTTP timeout")
+	}
+	if c.ExecMaxOutput < 4096 || c.ExecMaxOutput > 8<<20 || c.ExecMaxJobs < 1 || c.ExecMaxJobs > 64 || c.ExecMemoryBytes < 64<<20 || c.ExecCPUSeconds < 1 || c.ExecMaxProcesses < 8 || c.ExecMaxOpenFiles < 64 {
+		return errors.New("execution resource limits are outside allowed ranges")
+	}
+	if !c.EnableExec && !c.EnableGitWrite {
+		return nil
+	}
+	var err error
+	if c.BwrapPath, err = exec.LookPath("bwrap"); err != nil {
+		return errors.New("agentic features require bubblewrap (bwrap)")
+	}
+	if c.EnableExec || c.EnableGitNetwork {
+		if c.Slirp4netnsPath, err = exec.LookPath("slirp4netns"); err != nil {
+			return errors.New("networked agentic features require slirp4netns for isolated network egress")
+		}
+	}
+	if c.SystemdRunPath, err = exec.LookPath("systemd-run"); err != nil {
+		return errors.New("agentic features require systemd-run for cgroup resource limits")
+	}
+	if c.EnableGitNetwork {
+		switch c.GitCredentialMode {
+		case "none":
+		case "ssh_key":
+			if err := secureCredentialFile(c.GitCredentialFile, c.WorkspaceRoot); err != nil {
+				return fmt.Errorf("invalid SSH credential file: %w", err)
+			}
+			if err := secureCredentialFile(c.GitKnownHostsFile, c.WorkspaceRoot); err != nil {
+				return fmt.Errorf("invalid known-hosts file: %w", err)
+			}
+		case "https_token":
+			if err := secureCredentialFile(c.GitCredentialFile, c.WorkspaceRoot); err != nil {
+				return fmt.Errorf("invalid HTTPS credential file: %w", err)
+			}
+		default:
+			return errors.New("MCP_GIT_CREDENTIAL_MODE must be none, ssh_key, or https_token")
+		}
+	}
+	return nil
+}
+
+func secureCredentialFile(path, workspaceRoot string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("path must be absolute")
+	}
+	path = filepath.Clean(path)
+	if path == workspaceRoot || strings.HasPrefix(path, workspaceRoot+string(filepath.Separator)) {
+		return errors.New("path must be outside workspace")
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 {
+		return errors.New("file must be regular and mode 0600 or stricter")
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || sys.Nlink != 1 || int(sys.Uid) != os.Getuid() {
+		return errors.New("file must be single-linked and owned by server user")
+	}
+	return nil
+}

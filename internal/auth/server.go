@@ -17,13 +17,23 @@ type Server struct {
 	passwordSalt      []byte
 	passwordHash      []byte
 	loginLimiter      *attemptLimiter
+	scopes            []string
+	scopeSet          map[string]bool
 }
 
-func NewServer(publicURL, password string, store *Store) (*Server, error) {
+func NewServer(publicURL, password string, store *Store, enabledScopes ...string) (*Server, error) {
 	salt := []byte("workspace-mcp-admin-password-v1")
 	var hash []byte
 	if store != nil {
 		hash = argon2.IDKey([]byte(password), salt, 3, 64*1024, 2, 32)
+	}
+	scopes := []string{"workspace"}
+	seen := map[string]bool{"workspace": true}
+	for _, scope := range enabledScopes {
+		if scope != "" && !seen[scope] {
+			scopes = append(scopes, scope)
+			seen[scope] = true
+		}
 	}
 	return &Server{
 		publicURL:    publicURL,
@@ -32,6 +42,8 @@ func NewServer(publicURL, password string, store *Store) (*Server, error) {
 		passwordSalt: salt,
 		passwordHash: hash,
 		loginLimiter: newAttemptLimiter(),
+		scopes:       scopes,
+		scopeSet:     seen,
 	}, nil
 }
 

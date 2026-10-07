@@ -18,16 +18,21 @@ import (
 type Config struct {
 	Logger             *slog.Logger
 	PublicOrigin       string
+	OriginPaths        []string
+	AllowedOrigins     []string
 	TrustLoopbackProxy bool
 	MaxConcurrency     int
 	RequestTimeout     time.Duration
 }
 type chain struct {
-	next  http.Handler
-	cfg   Config
-	sem   chan struct{}
-	mu    sync.Mutex
-	rates map[string]*rate
+	next             http.Handler
+	cfg              Config
+	sem              chan struct{}
+	mu               sync.Mutex
+	rates            map[string]*rate
+	publicOrigin     string
+	allowedOrigins   []string
+	originPathsExact map[string]bool
 }
 type rate struct {
 	start time.Time
@@ -44,7 +49,21 @@ func Harden(next http.Handler, cfg Config) http.Handler {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 32
 	}
-	return &chain{next: next, cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrency), rates: map[string]*rate{}}
+	h := &chain{next: next, cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrency), rates: map[string]*rate{}, originPathsExact: map[string]bool{}}
+	if cfg.PublicOrigin != "" {
+		if o, ok := canonicalOrigin(cfg.PublicOrigin); ok {
+			h.publicOrigin = o
+		}
+	}
+	for _, allowed := range cfg.AllowedOrigins {
+		if o, ok := canonicalOrigin(allowed); ok {
+			h.allowedOrigins = append(h.allowedOrigins, o)
+		}
+	}
+	for _, p := range cfg.OriginPaths {
+		h.originPathsExact[p] = true
+	}
+	return h
 }
 func (h *chain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
@@ -60,7 +79,8 @@ func (h *chain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal server error", 500)
 		}
 	}()
-	if !h.validOrigin(r) {
+	if h.requiresOriginCheck(r.URL.Path) && !h.validOrigin(r) {
+		h.cfg.Logger.Warn("request origin rejected", "request_id", id, "path", r.URL.Path, "origin", r.Header.Get("Origin"))
 		http.Error(w, "forbidden origin", 403)
 		return
 	}
@@ -95,20 +115,66 @@ func (h *chain) security(w http.ResponseWriter) {
 	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	w.Header().Set("Cache-Control", "no-store")
 }
+func (h *chain) requiresOriginCheck(path string) bool {
+	if len(h.cfg.OriginPaths) == 0 {
+		return true
+	}
+	return h.originPathsExact[path]
+}
+
+// canonicalOrigin normalizes an Origin header value for comparison:
+// default ports (https:443, http:80) are dropped and the host is
+// lowercased, per origin-equivalence rules.
+func canonicalOrigin(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", false
+	}
+	if port := u.Port(); port != "" && !((u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80")) {
+		host = net.JoinHostPort(host, port)
+	}
+	return u.Scheme + "://" + host, true
+}
 func (h *chain) validOrigin(r *http.Request) bool {
 	raw := r.Header.Get("Origin")
 	if raw == "" {
 		return true
 	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Path != "" && u.Path != "/" {
+	origin, ok := canonicalOrigin(raw)
+	if !ok {
 		return false
 	}
-	origin := u.Scheme + "://" + u.Host
-	if h.cfg.PublicOrigin != "" {
-		return origin == h.cfg.PublicOrigin
+	if h.publicOrigin != "" {
+		if origin == h.publicOrigin {
+			return true
+		}
+		for _, allowed := range h.allowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		return false
 	}
-	return (u.Scheme == "http" || u.Scheme == "https") && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1" || u.Hostname() == "localhost")
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && isLoopbackHost(origin)
+}
+func isLoopbackHost(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 func (h *chain) remoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

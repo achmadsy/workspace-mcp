@@ -113,17 +113,38 @@ Never use local mode behind a tunnel.
 ### Option A — Quick Tunnel (testing only)
 
 ```bash
-MCP_ADMIN_PASSWORD='long-random' \
-MCP_STATE_DIR=~/.local/share/workspace-mcp \
-MCP_STATE_KEY="$(openssl rand -base64 32)" \
-  ./scripts/start-tunnel.sh /path/to/project
+./scripts/start-tunnel.sh /path/to/project
 ```
 
-The script starts `cloudflared`, prints the exact connector URL
-(`https://<random>.trycloudflare.com/mcp`), then starts the server. Quick
-Tunnels: no account needed, but the URL **changes on every restart**, there is
-no SLA, and SSE is unsupported (this server is configured for JSON responses,
-so that is fine).
+By default the launcher runs inside a detached tmux session named
+`workspace-mcp-tunnel` and returns immediately:
+
+```bash
+tmux attach -t workspace-mcp-tunnel   # watch logs / interact
+tmux kill-session -t workspace-mcp-tunnel   # stop tunnel and server
+```
+
+Add `--fg` to run in the calling terminal instead (Ctrl+C stops both
+processes). A custom session name can be set with `WORKSPACE_MCP_SESSION`.
+
+This one command bootstraps Go if needed, builds the server,
+generates or reuses secure OAuth credentials, starts `cloudflared`, prints the
+exact connector URL (`https://<random>.trycloudflare.com/mcp`) and the admin
+login password, then starts the server.
+
+Credentials and encrypted OAuth state live under
+`${XDG_DATA_HOME:-$HOME/.local/share}/workspace-mcp`: the directory is mode
+0700 and `quick-tunnel.env` is mode 0600. Every startup prints the connector
+URL and admin login password so they can be copied directly into Claude.ai.
+The launcher also prints a command for retrieving the password later.
+Environment values `MCP_ADMIN_PASSWORD`,
+`MCP_STATE_KEY`, and `MCP_STATE_DIR` override these defaults.
+
+Quick Tunnels need no Cloudflare account, but have no SLA and the URL
+**changes on every restart**. Delete and re-add the Claude.ai connector after
+each restart; OAuth clients and tokens reset when the public URL changes, while
+the admin password and encryption key remain stable. SSE is unsupported, so
+the server uses JSON responses.
 
 ### Option B — Named Tunnel (stable hostname, recommended)
 
@@ -196,7 +217,8 @@ CSRF, rate limits, origin validation, panic recovery.
 | Claude: "Authorization with the MCP server failed" | Wrong password, stale consent, or changed URL. Re-add the connector; each new Quick Tunnel URL resets all tokens. |
 | Tool calls fail after tunnel restart | Expected with Quick Tunnels — re-add connector with the new URL. |
 | `git_status` says "not a Git repository" | The workspace has no `.git`; run `git init` if intended. |
-| 403 "forbidden origin" | A browser sent a mismatched `Origin`; the public origin must equal `MCP_PUBLIC_URL`'s origin. |
+| 403 "forbidden origin" on `/mcp` | A browser sent a mismatched `Origin`; the public origin must equal `MCP_PUBLIC_URL`'s origin. OAuth login and consent use CSRF tokens and are not subject to this MCP endpoint check. |
+| Login or consent form fails | Password, expired browser session, or CSRF validation failed. Restart the authorization flow from the connector. |
 | 429 responses | Rate limiting (300 req/min per IP); check for tight client retry loops. |
 | WSL2: service not running after Windows restart | Enable systemd in `/etc/wsl.conf` or add the start command to logon automation. |
 

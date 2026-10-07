@@ -15,6 +15,10 @@ import (
 type pageData struct {
 	Title, Message, Action, CSRF, Request, Button string
 	Password                                      bool
+	// FormActionOrigin, when set, is added to form-action for the
+	// cross-origin redirect that follows consent (the OAuth client
+	// callback). Empty keeps the policy self-only.
+	FormActionOrigin string
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
@@ -28,7 +32,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	resource := q.Get("resource")
 	scope := q.Get("scope")
 	challenge := q.Get("code_challenge")
-	if q.Get("response_type") != "code" || clientID == "" || resource != s.publicURL || scope != "workspace" || q.Get("code_challenge_method") != "S256" || challenge == "" {
+	if q.Get("response_type") != "code" || clientID == "" || resource != s.publicURL || !s.validScope(scope) || q.Get("code_challenge_method") != "S256" || challenge == "" {
 		oauthError(w, 400, "invalid_request", "authorization request is invalid")
 		return
 	}
@@ -163,10 +167,12 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host := ""
+	callbackOrigin := ""
 	if u, e := url.Parse(p.RedirectURI); e == nil {
 		host = u.Host
+		callbackOrigin = u.Scheme + "://" + u.Host
 	}
-	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow"})
+	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigin: callbackOrigin})
 }
 
 func subtleCompare(a, b []byte) bool {
@@ -186,4 +192,17 @@ func pkceOK(verifier, challenge string) bool {
 	sum := sha256.Sum256([]byte(verifier))
 	return secureEqual(base64.RawURLEncoding.EncodeToString(sum[:]), challenge)
 }
-func validScope(v string) bool { return strings.TrimSpace(v) == "workspace" }
+func (s *Server) validScope(v string) bool {
+	parts := strings.Fields(v)
+	if len(parts) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(parts))
+	for _, scope := range parts {
+		if !s.scopeSet[scope] || seen[scope] {
+			return false
+		}
+		seen[scope] = true
+	}
+	return seen["workspace"]
+}

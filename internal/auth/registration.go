@@ -23,7 +23,6 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
 	var in registrationRequest
 	if dec.Decode(&in) != nil || len(in.RedirectURIs) == 0 || len(in.RedirectURIs) > 8 {
 		oauthError(w, 400, "invalid_client_metadata", "invalid registration document")
@@ -33,11 +32,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_client_metadata", "only public clients are supported")
 		return
 	}
-	if len(in.GrantTypes) > 0 && !sameSet(in.GrantTypes, []string{"authorization_code", "refresh_token"}) {
+	if len(in.GrantTypes) > 0 && (!contains(in.GrantTypes, "authorization_code") || !onlyContains(in.GrantTypes, "authorization_code", "refresh_token")) {
 		oauthError(w, 400, "invalid_client_metadata", "unsupported grant types")
 		return
 	}
-	if len(in.ResponseTypes) > 0 && !sameSet(in.ResponseTypes, []string{"code"}) {
+	if len(in.ResponseTypes) > 0 && !onlyContains(in.ResponseTypes, "code") {
 		oauthError(w, 400, "invalid_client_metadata", "unsupported response types")
 		return
 	}
@@ -64,24 +63,25 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 }
 func validRedirect(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.Fragment != "" || u.Host == "" {
+	if err != nil || u.IsAbs() == false || u.Opaque != "" || u.User != nil || u.Fragment != "" || u.Host == "" || u.Hostname() == "" {
 		return false
 	}
-	if raw == "https://claude.ai/api/mcp/auth_callback" {
+	if u.Scheme == "https" {
 		return true
 	}
 	return u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1" || u.Hostname() == "localhost") && u.Path == "/callback"
 }
-func sameSet(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
 	}
-	m := map[string]bool{}
-	for _, v := range want {
-		m[v] = true
-	}
-	for _, v := range got {
-		if !m[v] {
+	return false
+}
+func onlyContains(values []string, allowed ...string) bool {
+	for _, value := range values {
+		if !contains(allowed, value) {
 			return false
 		}
 	}

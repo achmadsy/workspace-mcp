@@ -37,30 +37,43 @@ func testServer(t *testing.T) (*Server, *httptest.Server) {
 	return s, ts
 }
 
-func dcr(t *testing.T, ts *httptest.Server) string {
+func registerClient(t *testing.T, ts *httptest.Server, in map[string]any) (int, map[string]any) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{
-		"redirect_uris":              []string{"https://claude.ai/api/mcp/auth_callback"},
-		"client_name":                "Claude",
-		"grant_types":                []string{"authorization_code", "refresh_token"},
-		"response_types":             []string{"code"},
-		"token_endpoint_auth_method": "none",
-	})
+	body, _ := json.Marshal(in)
 	resp, err := http.Post(ts.URL+"/register", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 201 {
-		t.Fatalf("register status %d", resp.StatusCode)
-	}
-	var out struct {
-		ClientID string `json:"client_id"`
-	}
+	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	return out.ClientID
+	return resp.StatusCode, out
+}
+
+func dcrWithRedirect(t *testing.T, ts *httptest.Server, redirect string) string {
+	t.Helper()
+	status, out := registerClient(t, ts, map[string]any{
+		"redirect_uris":              []string{redirect},
+		"client_name":                "Claude",
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"response_types":             []string{"code"},
+		"token_endpoint_auth_method": "none",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("register status %d: %v", status, out)
+	}
+	clientID, _ := out["client_id"].(string)
+	if clientID == "" {
+		t.Fatalf("register response missing client_id: %v", out)
+	}
+	return clientID
+}
+
+func dcr(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	return dcrWithRedirect(t, ts, "https://claude.ai/api/mcp/auth_callback")
 }
 
 func pkcePair(t *testing.T) (verifier, challenge string) {
@@ -134,10 +147,23 @@ func fullFlow(t *testing.T, ts *httptest.Server, clientID, redirect string) (cod
 	resp.Body.Close()
 	t.Logf("consent POST: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	loc = resp.Header.Get("Location")
-	if !strings.HasPrefix(loc, redirect) {
-		t.Fatalf("expected redirect to client, got %q", loc)
+	gotRedirect, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse redirect location: %v", err)
 	}
-	code = queryOf(loc[strings.Index(loc, "?"):]).Get("code")
+	wantRedirect, err := url.Parse(redirect)
+	if err != nil {
+		t.Fatalf("parse expected redirect: %v", err)
+	}
+	if gotRedirect.Scheme != wantRedirect.Scheme || gotRedirect.Host != wantRedirect.Host || gotRedirect.Path != wantRedirect.Path {
+		t.Fatalf("expected redirect to %q, got %q", redirect, loc)
+	}
+	for key, values := range wantRedirect.Query() {
+		if !sameStrings(gotRedirect.Query()[key], values) {
+			t.Fatalf("redirect query %q changed: want %v, got %v", key, values, gotRedirect.Query()[key])
+		}
+	}
+	code = gotRedirect.Query().Get("code")
 	t.Logf("fullFlow code=%q loc=%q", code, loc)
 	return code
 }
@@ -173,6 +199,18 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type simpleJar struct{ cookies []*http.Cookie }
@@ -282,35 +320,148 @@ func TestPKCEAndRedirectEnforcement(t *testing.T) {
 	}
 }
 
-func TestDCRRejectsArbitraryHTTPSRedirect(t *testing.T) {
+func TestDCRCompatibility(t *testing.T) {
 	_, ts := testServer(t)
-	body, _ := json.Marshal(map[string]any{
-		"redirect_uris":              []string{"https://evil.example.com/callback"},
-		"token_endpoint_auth_method": "none",
-	})
-	resp, err := http.Post(ts.URL+"/register", "application/json", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name     string
+		input    map[string]any
+		wantCode int
+	}{
+		{
+			name: "RFC metadata and authorization code subset",
+			input: map[string]any{
+				"redirect_uris":              []string{"https://connect.example.com:8443/oauth/callback?source=claude"},
+				"client_name":                "Claude",
+				"client_uri":                 "https://claude.ai",
+				"logo_uri":                   "https://claude.ai/logo.png",
+				"scope":                      "workspace",
+				"contacts":                   []string{"mcp@example.com"},
+				"grant_types":                []string{"authorization_code"},
+				"response_types":             []string{"code"},
+				"token_endpoint_auth_method": "none",
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name: "omitted optional metadata",
+			input: map[string]any{
+				"redirect_uris": []string{"https://connect.example.com/callback"},
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name: "loopback callback",
+			input: map[string]any{
+				"redirect_uris": []string{"http://127.0.0.1:49152/callback"},
+			},
+			wantCode: http.StatusCreated,
+		},
+		{
+			name: "HTTPS fragment",
+			input: map[string]any{
+				"redirect_uris": []string{"https://connect.example.com/callback#fragment"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "HTTPS userinfo",
+			input: map[string]any{
+				"redirect_uris": []string{"https://user:pass@connect.example.com/callback"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "non-loopback HTTP",
+			input: map[string]any{
+				"redirect_uris": []string{"http://connect.example.com/callback"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "wrong loopback path",
+			input: map[string]any{
+				"redirect_uris": []string{"http://localhost/not-callback"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "unsupported grant",
+			input: map[string]any{
+				"redirect_uris": []string{"https://connect.example.com/callback"},
+				"grant_types":   []string{"client_credentials"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "refresh only",
+			input: map[string]any{
+				"redirect_uris": []string{"https://connect.example.com/callback"},
+				"grant_types":   []string{"refresh_token"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "unsupported response type",
+			input: map[string]any{
+				"redirect_uris":  []string{"https://connect.example.com/callback"},
+				"response_types": []string{"token"},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "empty redirects",
+			input: map[string]any{
+				"redirect_uris": []string{},
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "confidential client",
+			input: map[string]any{
+				"redirect_uris":              []string{"https://connect.example.com/callback"},
+				"token_endpoint_auth_method": "client_secret_basic",
+			},
+			wantCode: http.StatusBadRequest,
+		},
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("arbitrary redirect must be rejected, got %d", resp.StatusCode)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, out := registerClient(t, ts, tt.input)
+			if status != tt.wantCode {
+				t.Fatalf("register status %d, want %d: %v", status, tt.wantCode, out)
+			}
+			if status == http.StatusCreated {
+				if out["client_id"] == "" || out["token_endpoint_auth_method"] != "none" {
+					t.Fatalf("invalid registration response: %v", out)
+				}
+			}
+		})
 	}
 }
 
-func TestDCRRejectsConfidential(t *testing.T) {
+func TestDCRRejectsTooManyRedirects(t *testing.T) {
 	_, ts := testServer(t)
-	body, _ := json.Marshal(map[string]any{
-		"redirect_uris":              []string{"https://claude.ai/api/mcp/auth_callback"},
-		"token_endpoint_auth_method": "client_secret_basic",
-	})
-	resp, err := http.Post(ts.URL+"/register", "application/json", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatal(err)
+	redirects := make([]string, 9)
+	for i := range redirects {
+		redirects[i] = "https://connect.example.com/callback"
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("confidential client must be rejected, got %d", resp.StatusCode)
+	status, _ := registerClient(t, ts, map[string]any{"redirect_uris": redirects})
+	if status != http.StatusBadRequest {
+		t.Fatalf("too many redirects must be rejected, got %d", status)
+	}
+}
+
+func TestArbitraryHTTPSRedirectFlow(t *testing.T) {
+	_, ts := testServer(t)
+	redirect := "https://connect.example.com/oauth/callback?source=claude"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	code := fullFlow(t, ts, clientID, redirect)
+	status, out := exchange(t, ts, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "client_id": {clientID},
+		"redirect_uri": {redirect}, "resource": {testURL}, "code_verifier": {strings.Repeat("v", 64)},
+	})
+	if status != http.StatusOK || out["access_token"] == "" {
+		t.Fatalf("token exchange: %d %v", status, out)
 	}
 }
 
@@ -350,6 +501,88 @@ func TestLoginRateLimit(t *testing.T) {
 	s, ts := testServer(t)
 	_, _ = s, ts
 	// covered by attemptLimiter unit below
+}
+
+func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
+	_, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	_, challenge := pkcePair(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirect},
+		"resource":              {testURL},
+		"scope":                 {"workspace"},
+		"state":                 {"st123"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	jar := &simpleJar{}
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Get(ts.URL + "/authorize?" + q.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/login") {
+		t.Fatalf("expected login redirect, got %q", loc)
+	}
+	resp, err = client.Get(ts.URL + loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginCSP := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(loginCSP, "form-action 'self'") || strings.Contains(loginCSP, "claude.ai") {
+		t.Fatalf("login CSP must stay self-only: %q", loginCSP)
+	}
+	loginBody := readAll(t, resp.Body)
+	resp.Body.Close()
+
+	resp, err = client.PostForm(ts.URL+"/login", url.Values{"password": {"correct horse"}, "csrf": {extractCSRF(t, loginBody)}, "request": {queryOf(loc).Get("request")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 302 || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
+		t.Fatalf("login redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+
+	// Consent page for a second client must advertise only its own callback.
+	otherRedirect := "https://connect.example.com:8443/oauth/callback"
+	otherClientID := dcrWithRedirect(t, ts, otherRedirect)
+	_, challenge2 := pkcePair(t)
+	q2 := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {otherClientID},
+		"redirect_uri":          {otherRedirect},
+		"resource":              {testURL},
+		"scope":                 {"workspace"},
+		"code_challenge":        {challenge2},
+		"code_challenge_method": {"S256"},
+	}
+	resp, err = client.Get(ts.URL + "/authorize?" + q2.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
+		t.Fatalf("expected consent redirect, got %q", resp.Header.Get("Location"))
+	}
+
+	resp, err = client.Get(ts.URL + resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	consentCSP := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(consentCSP, "form-action 'self' https://connect.example.com:8443") {
+		t.Fatalf("consent CSP must allow registered callback origin: %q", consentCSP)
+	}
+	if strings.Contains(consentCSP, "claude.ai") {
+		t.Fatalf("consent CSP must not allow unrelated callbacks: %q", consentCSP)
+	}
+	resp.Body.Close()
 }
 
 func TestAttemptLimiter(t *testing.T) {

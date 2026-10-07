@@ -66,6 +66,10 @@ func (s *Server) handler() http.Handler {
 		JSONResponse:                 true, // Quick Tunnels do not support SSE.
 		MaxRequestBodyBytes:          limits.MaxRequestBody,
 		PropagateRequestCancellation: true,
+		// A trusted reverse tunnel connects from loopback while preserving the
+		// public Host header. The SDK's localhost DNS-rebinding check would reject
+		// that valid proxy shape; httpx origin protection remains active.
+		DisableLocalhostProtection: s.cfg.Mode == config.ModePublic && s.cfg.TrustTunnel,
 	})
 	if s.cfg.Mode == config.ModePublic {
 		s.auth.Register(root)
@@ -79,6 +83,8 @@ func (s *Server) handler() http.Handler {
 	}
 	return httpx.Harden(root, httpx.Config{
 		PublicOrigin:       s.cfg.Origin(),
+		OriginPaths:        []string{"/mcp", "/logout"},
+		AllowedOrigins:     s.cfg.AllowedOrigins,
 		TrustLoopbackProxy: s.cfg.TrustTunnel,
 		MaxConcurrency:     limits.MaxHTTPConcurrency,
 		RequestTimeout:     limits.HTTPTimeout,

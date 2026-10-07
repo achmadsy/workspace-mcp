@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -96,6 +97,16 @@ func (r *Root) ProcPath() (path string, cleanup func(), err error) {
 		return "", nil, err
 	}
 	return fmt.Sprintf("/proc/self/fd/%d", fd), func() { _ = unix.Close(fd) }, nil
+}
+
+// SandboxFile returns a duplicated workspace descriptor suitable for passing
+// through exec.Cmd.ExtraFiles. Caller owns returned file.
+func (r *Root) SandboxFile() (*os.File, error) {
+	fd, err := r.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "workspace-root"), nil
 }
 
 func regularInfo(fd int) (unix.Stat_t, error) {

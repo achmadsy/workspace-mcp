@@ -44,10 +44,14 @@ func (s *Server) ensureSession(w http.ResponseWriter, r *http.Request) (string, 
 func secureEqual(a, b string) bool {
 	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
-func render(w http.ResponseWriter, data any) {
+func render(w http.ResponseWriter, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	formAction := "form-action 'self'"
+	if data.FormActionOrigin != "" {
+		formAction += " " + data.FormActionOrigin
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; "+formAction+"; base-uri 'none'; frame-ancestors 'none'")
 	if err := page.Execute(w, data); err != nil {
 		http.Error(w, "render failed", 500)
 	}

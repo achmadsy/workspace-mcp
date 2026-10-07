@@ -66,7 +66,7 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_grant", "authorization code is invalid")
 		return
 	}
-	tokenResponse(w, access, refresh)
+	tokenResponse(w, access, refresh, g.Scope)
 }
 func (s *Server) exchangeRefresh(w http.ResponseWriter, r *http.Request) {
 	h := hashToken(r.Form.Get("refresh_token"))
@@ -102,7 +102,9 @@ func (s *Server) exchangeRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_grant", "refresh token is invalid")
 		return
 	}
-	tokenResponse(w, access, refresh)
+	var scope string
+	_ = s.store.view(func(st *state) error { scope = st.Refresh[hashToken(refresh)].Scope; return nil })
+	tokenResponse(w, access, refresh, scope)
 }
 func newTokenTriple() (string, string, string, error) {
 	a, e := randomToken()
@@ -116,8 +118,8 @@ func newTokenTriple() (string, string, string, error) {
 	f, e := randomToken()
 	return a, r, f, e
 }
-func tokenResponse(w http.ResponseWriter, a, r string) {
-	writeJSON(w, 200, map[string]any{"access_token": a, "token_type": "Bearer", "expires_in": int(limits.AccessTokenTTL.Seconds()), "refresh_token": r, "scope": "workspace"})
+func tokenResponse(w http.ResponseWriter, a, r, scope string) {
+	writeJSON(w, 200, map[string]any{"access_token": a, "token_type": "Bearer", "expires_in": int(limits.AccessTokenTTL.Seconds()), "refresh_token": r, "scope": scope})
 }
 func (s *Server) VerifyToken(ctx context.Context, raw string, req *http.Request) (*mcpauth.TokenInfo, error) {
 	h := hashToken(raw)
@@ -128,5 +130,5 @@ func (s *Server) VerifyToken(ctx context.Context, raw string, req *http.Request)
 	if !ok || revoked || time.Now().After(rec.ExpiresAt) || rec.Resource != s.publicURL {
 		return nil, mcpauth.ErrInvalidToken
 	}
-	return &mcpauth.TokenInfo{Scopes: []string{rec.Scope}, Expiration: rec.ExpiresAt, UserID: "workspace-owner"}, nil
+	return &mcpauth.TokenInfo{Scopes: strings.Fields(rec.Scope), Expiration: rec.ExpiresAt, UserID: "workspace-owner", Extra: map[string]any{"client_id": rec.ClientID}}, nil
 }

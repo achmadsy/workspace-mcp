@@ -13,26 +13,43 @@ func passthrough() http.Handler {
 }
 
 func TestOriginValidation(t *testing.T) {
-	h := Harden(passthrough(), Config{PublicOrigin: "https://mcp.example.com"})
-	req := httptest.NewRequest("POST", "http://x/mcp", nil)
-	req.Header.Set("Origin", "https://evil.example.com")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 403 {
-		t.Fatalf("bad origin must 403, got %d", rec.Code)
+	h := Harden(passthrough(), Config{
+		PublicOrigin:   "https://mcp.example.com",
+		OriginPaths:    []string{"/mcp", "/logout"},
+		AllowedOrigins: []string{"https://claude.ai", "https://claude.com"},
+	})
+	tests := []struct {
+		name   string
+		path   string
+		origin string
+		want   int
+	}{
+		{name: "foreign MCP origin", path: "/mcp", origin: "https://evil.example.com", want: 403},
+		{name: "no MCP origin", path: "/mcp", want: 200},
+		{name: "public MCP origin", path: "/mcp", origin: "https://mcp.example.com", want: 200},
+		{name: "claude.ai MCP origin", path: "/mcp", origin: "https://claude.ai", want: 200},
+		{name: "claude.ai default port", path: "/mcp", origin: "https://claude.ai:443", want: 200},
+		{name: "claude.com MCP origin", path: "/mcp", origin: "https://claude.com", want: 200},
+		{name: "public origin default port", path: "/mcp", origin: "https://mcp.example.com:443", want: 200},
+		{name: "claude.ai custom port", path: "/mcp", origin: "https://claude.ai:8443", want: 403},
+		{name: "lookalike MCP origin", path: "/mcp", origin: "https://evil-claude.ai", want: 403},
+		{name: "foreign login origin", path: "/login", origin: "https://claude.ai", want: 200},
+		{name: "foreign consent origin", path: "/consent", origin: "https://claude.ai", want: 200},
+		{name: "allowed logout origin", path: "/logout", origin: "https://claude.ai", want: 200},
+		{name: "foreign logout origin", path: "/logout", origin: "https://evil.example.com", want: 403},
 	}
-	req2 := httptest.NewRequest("POST", "http://x/mcp", nil) // no Origin: allowed (server-to-server)
-	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, req2)
-	if rec2.Code != 200 {
-		t.Fatalf("no origin must pass, got %d", rec2.Code)
-	}
-	req3 := httptest.NewRequest("POST", "http://x/mcp", nil)
-	req3.Header.Set("Origin", "https://mcp.example.com")
-	rec3 := httptest.NewRecorder()
-	h.ServeHTTP(rec3, req3)
-	if rec3.Code != 200 {
-		t.Fatalf("public origin must pass, got %d", rec3.Code)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "http://x"+tt.path, nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status %d, want %d", rec.Code, tt.want)
+			}
+		})
 	}
 }
 
