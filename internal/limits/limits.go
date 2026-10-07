@@ -16,10 +16,15 @@ const (
 	MaxSearchFiles                  = 10_000
 	MaxSearchBytes                  = 64 << 20
 	MaxSearchLineBytes              = 64 << 10
+	MaxSearchContextLines           = 20
+	MaxSearchIncludeGlobs           = 32
+	MaxSearchResultBytes            = 512 << 10
 	MaxPathBytes                    = 4_096
 	MaxPathComponent                = 255
 	MaxParentDepth                  = 64
 	MaxGitOutput                    = 1 << 20
+	MaxGitPaths                     = 256
+	MaxGitCommitMessageBytes        = 64 << 10
 	MaxExecOutput                   = 512 << 10
 	MaxExecArgs                     = 256
 	MaxExecArgBytes                 = 64 << 10
@@ -29,6 +34,7 @@ const (
 	MaxExecConcurrency              = 2
 	MaxRecursiveDeleteEntries       = 10_000
 	MaxGlobResults                  = 2_000
+	MaxGlobScanEntries              = 10_000
 	MaxPatchFiles                   = 128
 	MaxHTTPConcurrency              = 32
 )

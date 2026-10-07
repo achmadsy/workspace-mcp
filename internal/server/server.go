@@ -11,6 +11,7 @@ import (
 	"github.com/link/workspace-mcp/internal/git"
 	"github.com/link/workspace-mcp/internal/httpx"
 	"github.com/link/workspace-mcp/internal/limits"
+	"github.com/link/workspace-mcp/internal/sandboxexec"
 	"github.com/link/workspace-mcp/internal/workspace"
 	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -21,6 +22,7 @@ type Server struct {
 	cfg  config.Config
 	ws   *workspace.Root
 	gs   *git.Service
+	jobs *sandboxexec.Jobs
 	auth *auth.Server
 	srv  *mcp.Server
 }
@@ -30,31 +32,71 @@ func New(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	gs := git.New(cfg.WorkspaceRoot, ws)
-	var store *auth.Store
-	if cfg.Mode == config.ModePublic {
-		store, err = auth.OpenStore(cfg.StateDir, cfg.StateKey, cfg.PublicURL)
+	runner, err := sandboxexec.New(cfg, ws)
+	if err != nil {
+		ws.Close()
+		return nil, err
+	}
+	gs, err := git.NewAgentic(ws, runner)
+	if err != nil {
+		ws.Close()
+		return nil, err
+	}
+	var jobs *sandboxexec.Jobs
+	if cfg.EnableExec {
+		jobs, err = sandboxexec.NewJobs(runner)
 		if err != nil {
+			gs.Close()
 			ws.Close()
 			return nil, err
 		}
 	}
-	a, err := auth.NewServer(cfg.PublicURL, cfg.AdminPassword, store)
+	var store *auth.Store
+	if cfg.Mode == config.ModePublic {
+		store, err = auth.OpenStore(cfg.StateDir, cfg.StateKey, cfg.PublicURL)
+		if err != nil {
+			if jobs != nil {
+				jobs.Close()
+			}
+			gs.Close()
+			ws.Close()
+			return nil, err
+		}
+	}
+	enabledScopes := make([]string, 0, 3)
+	if cfg.EnableExec {
+		enabledScopes = append(enabledScopes, "workspace:exec")
+	}
+	if cfg.EnableGitWrite {
+		enabledScopes = append(enabledScopes, "workspace:git-write")
+	}
+	if cfg.EnableGitNetwork {
+		enabledScopes = append(enabledScopes, "workspace:git-network")
+	}
+	a, err := auth.NewServer(cfg.PublicURL, cfg.AdminPassword, store, enabledScopes...)
 	if err != nil {
 		if store != nil {
 			store.Close()
 		}
+		if jobs != nil {
+			jobs.Close()
+		}
+		gs.Close()
 		ws.Close()
 		return nil, err
 	}
-	s := &Server{cfg: cfg, ws: ws, gs: gs, auth: a}
+	s := &Server{cfg: cfg, ws: ws, gs: gs, jobs: jobs, auth: a}
 	s.srv = mcp.NewServer(&mcp.Implementation{Name: "workspace-mcp", Version: "1.0.0"}, nil)
-	registerTools(s.srv, ws, gs)
+	registerTools(s.srv, cfg, ws, gs, runner, jobs)
 	return s, nil
 }
 
 func (s *Server) Close() {
 	_ = s.auth.Close()
+	if s.jobs != nil {
+		s.jobs.Close()
+	}
+	s.gs.Close()
 	_ = s.ws.Close()
 }
 

@@ -39,6 +39,10 @@ func (r *Root) openParent(path string, create bool) (int, string, error) {
 }
 
 func (r *Root) atomicWrite(path string, content []byte) (changed bool, err error) {
+	return r.atomicWriteMode(path, content, true)
+}
+
+func (r *Root) atomicWriteMode(path string, content []byte, overwrite bool) (changed bool, err error) {
 	if len(content) > limits.MaxWriteBytes {
 		return false, errors.New("content exceeds write limit")
 	}
@@ -50,6 +54,10 @@ func (r *Root) atomicWrite(path string, content []byte) (changed bool, err error
 	mode := uint32(0o644)
 	oldfd, openErr := openAt(parent, base, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if openErr == nil {
+		if !overwrite {
+			unix.Close(oldfd)
+			return false, errors.New("destination already exists")
+		}
 		old, st, readErr := readBounded(oldfd, int64(limits.MaxFileBytes))
 		unix.Close(oldfd)
 		if readErr != nil {
@@ -88,7 +96,12 @@ func (r *Root) atomicWrite(path string, content []byte) (changed bool, err error
 	if err := unix.Fsync(tfd); err != nil {
 		return false, fmt.Errorf("sync temporary file: %w", err)
 	}
-	if err := unix.Renameat(parent, tmp, parent, base); err != nil {
+	if overwrite {
+		err = unix.Renameat(parent, tmp, parent, base)
+	} else {
+		err = unix.Renameat2(parent, tmp, parent, base, unix.RENAME_NOREPLACE)
+	}
+	if err != nil {
 		return false, fmt.Errorf("replace destination: %w", err)
 	}
 	cleanup = false

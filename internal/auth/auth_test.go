@@ -465,6 +465,31 @@ func TestArbitraryHTTPSRedirectFlow(t *testing.T) {
 	}
 }
 
+func TestEnabledScopeMetadata(t *testing.T) {
+	base, _ := testServer(t)
+	s, err := NewServer("https://mcp.example.com/mcp", "test-password-1234", base.store, "workspace:exec", "workspace:git-write", "workspace:git-network")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+	w := httptest.NewRecorder()
+	s.protectedMetadata(w, r)
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	scopes := body["scopes_supported"].([]any)
+	if len(scopes) != 4 {
+		t.Fatalf("scopes = %#v", scopes)
+	}
+	if !s.validScope("workspace workspace:exec workspace:git-write workspace:git-network") {
+		t.Fatal("enabled scope set rejected")
+	}
+	if s.validScope("workspace workspace:unknown") {
+		t.Fatal("unknown scope accepted")
+	}
+}
+
 func TestMetadata(t *testing.T) {
 	_, ts := testServer(t)
 	resp, err := http.Get(ts.URL + "/.well-known/oauth-protected-resource/mcp")

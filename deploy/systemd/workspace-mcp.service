@@ -3,17 +3,28 @@ Description=Workspace MCP server
 After=network.target
 
 [Service]
+# Safe profile only. Agentic mode requires a user service with a usable
+# `systemd-run --user` manager and delegated cgroup v2; do not enable agentic
+# flags in this system unit without redesigning its service account/session.
 Type=simple
 EnvironmentFile=@ENV_FILE@
 ExecStart=@BIN@
 Restart=always
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
 ReadWritePaths=@WORKSPACE_ROOT@ @STATE_DIR@
 LimitNOFILE=65535
+TasksMax=256
 MemoryMax=256M
 CPUQuota=50%
 

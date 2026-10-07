@@ -43,6 +43,7 @@ type Config struct {
 	BwrapPath        string
 	Slirp4netnsPath  string
 	SystemdRunPath   string
+	PrlimitPath      string
 	ExecTimeout      time.Duration
 	ExecJobTimeout   time.Duration
 	ExecJobTTL       time.Duration
@@ -197,8 +198,8 @@ func (c *Config) validateAgentic() error {
 	if c.EnableGitNetwork && !c.EnableGitWrite {
 		return errors.New("MCP_ENABLE_GIT_NETWORK requires MCP_ENABLE_GIT_WRITE")
 	}
-	if c.ExecTimeout <= 0 || c.ExecTimeout >= limits.HTTPTimeout || c.ExecJobTimeout <= 0 || c.ExecJobTTL <= 0 {
-		return errors.New("execution timeouts must be positive and MCP_EXEC_TIMEOUT must be shorter than HTTP timeout")
+	if c.ExecTimeout <= 0 || c.ExecTimeout >= limits.HTTPTimeout || c.ExecJobTimeout < c.ExecTimeout || c.ExecJobTTL <= 0 {
+		return errors.New("execution timeouts must be positive, MCP_EXEC_TIMEOUT must be shorter than HTTP timeout, and MCP_EXEC_JOB_TIMEOUT must not be shorter than MCP_EXEC_TIMEOUT")
 	}
 	if c.ExecMaxOutput < 4096 || c.ExecMaxOutput > 8<<20 || c.ExecMaxJobs < 1 || c.ExecMaxJobs > 64 || c.ExecMemoryBytes < 64<<20 || c.ExecCPUSeconds < 1 || c.ExecMaxProcesses < 8 || c.ExecMaxOpenFiles < 64 {
 		return errors.New("execution resource limits are outside allowed ranges")
@@ -218,9 +219,15 @@ func (c *Config) validateAgentic() error {
 	if c.SystemdRunPath, err = exec.LookPath("systemd-run"); err != nil {
 		return errors.New("agentic features require systemd-run for cgroup resource limits")
 	}
+	if c.PrlimitPath, err = exec.LookPath("prlimit"); err != nil {
+		return errors.New("agentic features require prlimit for process resource limits")
+	}
 	if c.EnableGitNetwork {
 		switch c.GitCredentialMode {
 		case "none":
+			if c.GitCredentialFile != "" || c.GitKnownHostsFile != "" {
+				return errors.New("Git credential paths must be empty when MCP_GIT_CREDENTIAL_MODE=none")
+			}
 		case "ssh_key":
 			if err := secureCredentialFile(c.GitCredentialFile, c.WorkspaceRoot); err != nil {
 				return fmt.Errorf("invalid SSH credential file: %w", err)
@@ -229,6 +236,9 @@ func (c *Config) validateAgentic() error {
 				return fmt.Errorf("invalid known-hosts file: %w", err)
 			}
 		case "https_token":
+			if c.GitKnownHostsFile != "" {
+				return errors.New("MCP_GIT_KNOWN_HOSTS_FILE is valid only for ssh_key mode")
+			}
 			if err := secureCredentialFile(c.GitCredentialFile, c.WorkspaceRoot); err != nil {
 				return fmt.Errorf("invalid HTTPS credential file: %w", err)
 			}

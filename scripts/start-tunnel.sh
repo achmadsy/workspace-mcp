@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start a Cloudflare Quick Tunnel and workspace-mcp with secure persistent OAuth
-# credentials. Usage: ./scripts/start-tunnel.sh [--fg] /path/to/workspace
+# credentials. Usage: ./scripts/start-tunnel.sh [--fg] [--agentic] /path/to/workspace
 #
 # Default: the launcher re-executes itself inside a detached tmux session
 # (name: workspace-mcp-tunnel) and returns immediately. Use --fg to run in the
@@ -10,19 +10,22 @@ umask 077
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FOREGROUND=false
+AGENTIC=false
 WORKSPACE_ROOT=""
 SESSION_NAME="${WORKSPACE_MCP_SESSION:-workspace-mcp-tunnel}"
 for arg in "$@"; do
   case "$arg" in
     --fg|--foreground) FOREGROUND=true ;;
-    *) if [ -z "$WORKSPACE_ROOT" ]; then WORKSPACE_ROOT="$arg"; fi ;;
+    --agentic) AGENTIC=true ;;
+    --*) echo "unknown option: $arg" >&2; exit 1 ;;
+    *) if [ -z "$WORKSPACE_ROOT" ]; then WORKSPACE_ROOT="$arg"; else echo "unexpected argument: $arg" >&2; exit 1; fi ;;
   esac
 done
 if [ -z "$WORKSPACE_ROOT" ]; then
   WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 fi
 if [ -z "$WORKSPACE_ROOT" ]; then
-  echo "usage: $0 [--fg] /path/to/workspace" >&2
+  echo "usage: $0 [--fg] [--agentic] /path/to/workspace" >&2
   exit 1
 fi
 if [ ! -d "$WORKSPACE_ROOT" ]; then
@@ -40,7 +43,9 @@ if [ "$FOREGROUND" != true ] && [ -z "${TMUX:-}" ]; then
       echo "Stop:    tmux kill-session -t $SESSION_NAME"
       exit 0
     fi
-    tmux new-session -d -s "$SESSION_NAME" "exec '$0' --fg '$WORKSPACE_ROOT'"
+    AGENTIC_ARG=""
+    [ "$AGENTIC" = true ] && AGENTIC_ARG=" --agentic"
+    tmux new-session -d -s "$SESSION_NAME" "exec '$0' --fg$AGENTIC_ARG '$WORKSPACE_ROOT'"
     echo "Started in tmux session '$SESSION_NAME' (stays running when you log out of this shell)."
     echo "Attach:  tmux attach -t $SESSION_NAME"
     echo "Stop:    tmux kill-session -t $SESSION_NAME"
@@ -55,6 +60,26 @@ for command_name in cloudflared openssl curl python3 sha256sum tar; do
     exit 1
   }
 done
+
+if [ "$AGENTIC" = true ]; then
+  for command_name in bwrap slirp4netns systemd-run prlimit; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+      echo "$command_name not found; --agentic requires bubblewrap, slirp4netns, systemd-run, and prlimit" >&2
+      exit 1
+    }
+  done
+  if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+    echo "--agentic requires cgroup v2" >&2
+    exit 1
+  fi
+  if ! systemd-run --user --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
+    echo "--agentic requires a usable user systemd manager and delegated cgroup scope" >&2
+    exit 1
+  fi
+  export MCP_ENABLE_EXEC=true
+  export MCP_ENABLE_GIT_WRITE=true
+  export MCP_ENABLE_GIT_NETWORK=true
+fi
 
 export MCP_MODE=public
 export MCP_HOST=127.0.0.1
@@ -188,6 +213,9 @@ echo "  Admin login password: $MCP_ADMIN_PASSWORD"
 echo "  OAuth credentials: $CREDENTIAL_FILE"
 echo "  Show password later: sed -n 's/^MCP_ADMIN_PASSWORD_B64=//p' '$CREDENTIAL_FILE' | openssl base64 -d -A; echo"
 echo "  State directory: $MCP_STATE_DIR"
+if [ "$AGENTIC" = true ]; then
+  echo "  Agentic profile: ENABLED (sandboxed RCE, network, Git writes/push)"
+fi
 echo ""
 echo "  Password and encryption key persist across runs."
 echo "  Quick Tunnel URL changes on restart; re-add the connector."

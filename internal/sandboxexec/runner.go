@@ -4,16 +4,19 @@
 package sandboxexec
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +27,23 @@ import (
 	"github.com/link/workspace-mcp/internal/config"
 	"github.com/link/workspace-mcp/internal/limits"
 	"github.com/link/workspace-mcp/internal/workspace"
+	"golang.org/x/sys/unix"
 )
+
+const (
+	workspaceFD = 3
+	statusFD    = 4
+	blockFD     = 5
+	secretFD    = 6
+)
+
+// GitCredentialFiles are pre-opened, revalidated credential descriptors for one
+// dedicated Git network command. General Run and RunIsolated never accept them.
+type GitCredentialFiles struct {
+	SSHKey     *os.File
+	KnownHosts *os.File
+	HTTPSToken *os.File
+}
 
 type Request struct {
 	Argv      []string          `json:"argv,omitempty"`
@@ -56,15 +75,25 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 	if !cfg.EnableExec && !cfg.EnableGitWrite {
 		return nil, nil
 	}
-	if cfg.BwrapPath == "" || cfg.SystemdRunPath == "" || ((cfg.EnableExec || cfg.EnableGitNetwork) && cfg.Slirp4netnsPath == "") {
+	if cfg.BwrapPath == "" || cfg.SystemdRunPath == "" || cfg.PrlimitPath == "" || ((cfg.EnableExec || cfg.EnableGitNetwork) && cfg.Slirp4netnsPath == "") {
 		return nil, errors.New("sandbox helpers were not configured")
 	}
 	r := &Runner{cfg: cfg, root: root, sem: make(chan struct{}, limits.MaxExecConcurrency)}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := r.RunIsolated(ctx, Request{Argv: []string{"/bin/true"}, TimeoutMS: 4000}, nil)
-	if err != nil || res.ExitCode != 0 {
+	testRequest := Request{Argv: []string{"/bin/true"}, TimeoutMS: 4000}
+	var res Result
+	var err error
+	if cfg.EnableExec || cfg.EnableGitNetwork {
+		res, err = r.Run(ctx, testRequest, nil)
+	} else {
+		res, err = r.RunIsolated(ctx, testRequest, nil)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("sandbox self-test failed: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("sandbox self-test failed with exit code %d", res.ExitCode)
 	}
 	return r, nil
 }
@@ -80,7 +109,34 @@ func (r *Runner) RunIsolated(ctx context.Context, request Request, extraEnv map[
 	return r.run(ctx, request, extraEnv, false)
 }
 
+// RunGitNetwork runs one typed Git network command with fixed-purpose credential
+// descriptors. Callers must provide either SSHKey+KnownHosts, HTTPSToken, or none.
+func (r *Runner) RunGitNetwork(ctx context.Context, request Request, extraEnv map[string]string, credentials GitCredentialFiles) (Result, error) {
+	if !r.cfg.EnableGitNetwork {
+		return Result{}, errors.New("Git network execution is disabled")
+	}
+	if (credentials.HTTPSToken != nil) == (credentials.SSHKey != nil || credentials.KnownHosts != nil) && credentials.HTTPSToken != nil {
+		return Result{}, errors.New("provide exactly one Git credential mode")
+	}
+	if (credentials.SSHKey == nil) != (credentials.KnownHosts == nil) {
+		return Result{}, errors.New("SSH key and known_hosts must be provided together")
+	}
+	out := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	return r.runWithBuffersAndCredentials(ctx, request, extraEnv, true, out, errOut, nil, credentials)
+}
+
 func (r *Runner) run(ctx context.Context, request Request, extraEnv map[string]string, network bool) (Result, error) {
+	out := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	return r.runWithBuffers(ctx, request, extraEnv, network, out, errOut, nil)
+}
+
+func (r *Runner) runWithBuffers(ctx context.Context, request Request, extraEnv map[string]string, network bool, out, errOut *limitBuffer, started func()) (Result, error) {
+	return r.runWithBuffersAndCredentials(ctx, request, extraEnv, network, out, errOut, started, GitCredentialFiles{})
+}
+
+func (r *Runner) runWithBuffersAndCredentials(ctx context.Context, request Request, extraEnv map[string]string, network bool, out, errOut *limitBuffer, started func(), credentials GitCredentialFiles) (Result, error) {
 	if err := validateRequest(request); err != nil {
 		return Result{}, err
 	}
@@ -107,21 +163,74 @@ func (r *Runner) run(ctx context.Context, request Request, extraEnv map[string]s
 	}
 	defer rootFile.Close()
 
-	args, networkCleanup, err := r.commandArgs(runCtx, request, network)
+	var statusReader, statusWriter, blockReader, blockWriter *os.File
+	if network {
+		statusReader, statusWriter, err = os.Pipe()
+		if err != nil {
+			return Result{}, errors.New("sandbox status pipe is unavailable")
+		}
+		defer statusReader.Close()
+		defer statusWriter.Close()
+		blockReader, blockWriter, err = os.Pipe()
+		if err != nil {
+			return Result{}, errors.New("sandbox startup pipe is unavailable")
+		}
+		defer blockReader.Close()
+		defer blockWriter.Close()
+	}
+
+	args, secretFiles, generatedFiles, err := r.commandArgs(request, extraEnv, network, credentials)
 	if err != nil {
 		return Result{}, err
 	}
-	defer networkCleanup()
+	for _, file := range generatedFiles {
+		defer file.Close()
+	}
+	cmd := r.systemdCommand(runCtx, args, rootFile, statusWriter, blockReader, secretFiles, out, errOut)
+	startedAt := time.Now()
+	if err := cmd.Start(); err != nil {
+		return Result{}, errors.New("sandbox command could not be started")
+	}
+	if started != nil {
+		started()
+	}
+	if network {
+		_ = statusWriter.Close()
+		statusWriter = nil
+		_ = blockReader.Close()
+		blockReader = nil
+	}
+
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- cmd.Wait()
+		close(commandDone)
+	}()
+
+	var runErr error
+	if network {
+		runErr, err = r.runNetworkHandshake(runCtx, cmd, commandDone, statusReader, blockWriter, errOut)
+		if err != nil {
+			cancelProcessGroup(cmd)
+			<-commandDone
+			return Result{}, err
+		}
+	} else {
+		runErr = <-commandDone
+	}
+	return commandResult(runCtx, cmd, runErr, startedAt, out, errOut), nil
+}
+
+func (r *Runner) systemdCommand(ctx context.Context, sandboxArgs []string, rootFile, statusWriter, blockReader *os.File, secretFiles []*os.File, out, errOut io.Writer) *exec.Cmd {
 	unit := randomUnit()
 	systemdArgs := []string{
-		"--user", "--wait", "--pipe", "--quiet", "--collect",
+		"--user", "--scope", "--quiet", "--collect",
 		"--unit=" + unit,
 		"--property=MemoryMax=" + strconv.FormatUint(r.cfg.ExecMemoryBytes, 10),
 		"--property=TasksMax=" + strconv.FormatUint(r.cfg.ExecMaxProcesses, 10),
 		"--property=CPUQuota=100%",
-		"--property=NoNewPrivileges=yes",
 		"--",
-		"prlimit",
+		r.cfg.PrlimitPath,
 		"--cpu=" + strconv.FormatUint(r.cfg.ExecCPUSeconds, 10),
 		"--as=" + strconv.FormatUint(r.cfg.ExecMemoryBytes, 10),
 		"--fsize=" + strconv.Itoa(r.cfg.ExecMaxOutput*2),
@@ -129,46 +238,86 @@ func (r *Runner) run(ctx context.Context, request Request, extraEnv map[string]s
 		"--nofile=" + strconv.FormatUint(r.cfg.ExecMaxOpenFiles, 10),
 		"--",
 	}
-	systemdArgs = append(systemdArgs, args...)
-
-	cmd := exec.CommandContext(runCtx, r.cfg.SystemdRunPath, systemdArgs...)
+	systemdArgs = append(systemdArgs, sandboxArgs...)
+	cmd := exec.CommandContext(ctx, r.cfg.SystemdRunPath, systemdArgs...)
 	cmd.ExtraFiles = []*os.File{rootFile}
-	cmd.Env = buildEnvironment(request.Env, extraEnv)
+	if statusWriter != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, statusWriter, blockReader)
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, secretFiles...)
+	cmd.Env = buildEnvironment(nil, nil)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		cancelProcessGroup(cmd)
+		return nil
+	}
 	cmd.WaitDelay = time.Second
-	out := &limitBuffer{limit: r.cfg.ExecMaxOutput}
-	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput}
 	cmd.Stdout, cmd.Stderr = out, errOut
-	started := time.Now()
-	runErr := cmd.Run()
-	result := Result{
-		Stdout: out.String(), Stderr: errOut.String(), DurationMS: time.Since(started).Milliseconds(),
-		StdoutTruncated: out.truncated, StderrTruncated: errOut.truncated,
-	}
-	if runCtx.Err() != nil {
-		result.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-		result.Canceled = errors.Is(runCtx.Err(), context.Canceled)
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		result.ExitCode = -1
-		return result, nil
-	}
-	if runErr == nil {
-		return result, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			result.Signal = status.Signal().String()
-		}
-		return result, nil
-	}
-	return Result{}, errors.New("sandbox command could not be started")
+	return cmd
 }
 
-func (r *Runner) commandArgs(ctx context.Context, request Request, network bool) ([]string, func(), error) {
+func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, commandDone <-chan error, statusReader, blockWriter *os.File, errOut *limitBuffer) (error, error) {
+	status := make(chan childStatus, 1)
+	go readChildStatus(statusReader, status)
+
+	var childPID int
+	select {
+	case event := <-status:
+		if event.err != nil {
+			return nil, errors.New("sandbox did not report its network namespace")
+		}
+		childPID = event.pid
+	case runErr := <-commandDone:
+		return runErr, errors.New("sandbox exited before network setup")
+	case <-ctx.Done():
+		cancelProcessGroup(cmd)
+		return <-commandDone, nil
+	}
+
+	network, err := r.startNetwork(ctx, childPID, errOut)
+	if err != nil {
+		return nil, err
+	}
+	defer network.stop()
+
+	select {
+	case readyOK := <-network.ready:
+		if !readyOK {
+			return nil, errors.New("isolated network helper closed its readiness pipe")
+		}
+		if _, err := blockWriter.Write([]byte{1}); err != nil {
+			return nil, errors.New("sandbox startup synchronization failed")
+		}
+		_ = blockWriter.Close()
+	case err := <-network.done:
+		if err == nil {
+			return nil, errors.New("isolated network helper exited before readiness")
+		}
+		return nil, fmt.Errorf("isolated network helper exited before readiness: %w", err)
+	case runErr := <-commandDone:
+		return runErr, errors.New("sandbox exited before network became ready")
+	case <-ctx.Done():
+		cancelProcessGroup(cmd)
+		return <-commandDone, nil
+	}
+
+	select {
+	case runErr := <-commandDone:
+		return runErr, nil
+	case err := <-network.done:
+		cancelProcessGroup(cmd)
+		<-commandDone
+		if err == nil {
+			return nil, errors.New("isolated network helper exited unexpectedly")
+		}
+		return nil, fmt.Errorf("isolated network helper exited: %w", err)
+	case <-ctx.Done():
+		cancelProcessGroup(cmd)
+		return <-commandDone, nil
+	}
+}
+
+func (r *Runner) commandArgs(request Request, extraEnv map[string]string, network bool, credentials GitCredentialFiles) ([]string, []*os.File, []*os.File, error) {
 	cwd := "/workspace"
 	if request.Cwd != "" {
 		cwd += "/" + request.Cwd
@@ -184,22 +333,219 @@ func (r *Runner) commandArgs(ctx context.Context, request Request, network bool)
 		"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
 		"--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
 		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
-		"--bind", "/proc/self/fd/3", "/workspace", "--chdir", cwd,
+		"--bind", "/proc/self/fd/" + strconv.Itoa(workspaceFD), "/workspace", "--chdir", cwd,
 	}
-	cleanup := func() {}
 	if network {
 		if r.cfg.Slirp4netnsPath == "" {
-			return nil, cleanup, errors.New("isolated network helper is unavailable")
+			return nil, nil, nil, errors.New("isolated network helper is unavailable")
 		}
-		// Current runner deliberately fails closed until slirp namespace attachment
-		// is established by the asynchronous launch handshake.
-		return nil, cleanup, errors.New("isolated network setup is unavailable")
+		args = append(args,
+			"--json-status-fd", strconv.Itoa(statusFD),
+			"--block-fd", strconv.Itoa(blockFD),
+		)
 	}
-	_ = ctx
+	secretFiles := make([]*os.File, 0, 2)
+	generatedFiles := make([]*os.File, 0, 1)
+	nextFD := secretFD
+	switch {
+	case credentials.SSHKey != nil:
+		keySource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		secretFiles = append(secretFiles, credentials.SSHKey)
+		nextFD++
+		knownHostsSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		secretFiles = append(secretFiles, credentials.KnownHosts)
+		args = append(args,
+			"--dir", "/run", "--dir", "/run/workspace-mcp",
+			"--ro-bind", keySource, "/run/workspace-mcp/id",
+			"--ro-bind", knownHostsSource, "/run/workspace-mcp/known_hosts",
+		)
+		extraEnv = cloneEnvironment(extraEnv)
+		extraEnv["GIT_SSH_COMMAND"] = "/usr/bin/ssh -i /run/workspace-mcp/id -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/run/workspace-mcp/known_hosts -o GlobalKnownHostsFile=/dev/null -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o BatchMode=yes"
+	case credentials.HTTPSToken != nil:
+		help, err := anonymousFile("git-askpass", []byte("#!/bin/sh\ncase $1 in\n*Username*) printf '%s\\n' oauth2 ;;\n*Password*) cat \"$MCP_ASKPASS_TOKEN_FILE\" ;;\n*) exit 1 ;;\nesac\n"))
+		if err != nil {
+			return nil, nil, nil, errors.New("create HTTPS credential helper")
+		}
+		generatedFiles = append(generatedFiles, help)
+		helpSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		secretFiles = append(secretFiles, help)
+		nextFD++
+		tokenSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		secretFiles = append(secretFiles, credentials.HTTPSToken)
+		args = append(args,
+			"--dir", "/run", "--dir", "/run/workspace-mcp",
+			"--ro-bind", helpSource, "/run/workspace-mcp/askpass",
+			"--ro-bind", tokenSource, "/run/workspace-mcp/token",
+		)
+		extraEnv = cloneEnvironment(extraEnv)
+		extraEnv["GIT_ASKPASS"] = "/run/workspace-mcp/askpass"
+		extraEnv["MCP_ASKPASS_TOKEN_FILE"] = "/run/workspace-mcp/token"
+	}
+	args = append(args, "--", "/usr/bin/env", "-i")
+	args = append(args, buildEnvironment(request.Env, extraEnv)...)
 	if request.Script != "" {
-		return append(args, "--", "/bin/sh", "-c", request.Script), cleanup, nil
+		return append(args, "/bin/sh", "-c", request.Script), secretFiles, generatedFiles, nil
 	}
-	return append(args, append([]string{"--"}, request.Argv...)...), cleanup, nil
+	return append(args, request.Argv...), secretFiles, generatedFiles, nil
+}
+
+func anonymousFile(name string, content []byte) (*os.File, error) {
+	fd, err := unix.MemfdCreate(name, unix.MFD_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if _, err := file.Write(content); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err := unix.Fchmod(fd, 0o500); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func cloneEnvironment(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source)+2)
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+type childStatus struct {
+	pid int
+	err error
+}
+
+func readChildStatus(r io.Reader, result chan<- childStatus) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		var status struct {
+			ChildPID int `json:"child-pid"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &status); err != nil {
+			result <- childStatus{err: err}
+			return
+		}
+		if status.ChildPID > 0 {
+			result <- childStatus{pid: status.ChildPID}
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		result <- childStatus{err: err}
+	} else {
+		result <- childStatus{err: io.EOF}
+	}
+}
+
+type networkProcess struct {
+	cmd      *exec.Cmd
+	ready    <-chan bool
+	done     <-chan error
+	exit     *os.File
+	stopOnce sync.Once
+}
+
+func (r *Runner) startNetwork(ctx context.Context, childPID int, errOut io.Writer) (*networkProcess, error) {
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		return nil, errors.New("network readiness pipe is unavailable")
+	}
+	exitReader, exitWriter, err := os.Pipe()
+	if err != nil {
+		readyReader.Close()
+		readyWriter.Close()
+		return nil, errors.New("network lifetime pipe is unavailable")
+	}
+	args := []string{
+		"--configure", "--mtu=65520", "--disable-host-loopback",
+		"--ready-fd=3", "--exit-fd=4", strconv.Itoa(childPID), "tap0",
+	}
+	cmd := exec.CommandContext(ctx, r.cfg.Slirp4netnsPath, args...)
+	cmd.ExtraFiles = []*os.File{readyWriter, exitReader}
+	cmd.Env = buildEnvironment(nil, nil)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		cancelProcessGroup(cmd)
+		return nil
+	}
+	cmd.WaitDelay = time.Second
+	cmd.Stdout = io.Discard
+	cmd.Stderr = errOut
+	if err := cmd.Start(); err != nil {
+		readyReader.Close()
+		readyWriter.Close()
+		exitReader.Close()
+		exitWriter.Close()
+		return nil, errors.New("isolated network helper could not be started")
+	}
+	_ = readyWriter.Close()
+	_ = exitReader.Close()
+	ready := make(chan bool, 1)
+	go func() {
+		var b [1]byte
+		_, readErr := io.ReadFull(readyReader, b[:])
+		_ = readyReader.Close()
+		ready <- readErr == nil && b[0] == '1'
+		close(ready)
+	}()
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
+	return &networkProcess{cmd: cmd, ready: ready, done: done, exit: exitWriter}, nil
+}
+
+func (n *networkProcess) stop() {
+	n.stopOnce.Do(func() {
+		_ = n.exit.Close()
+		select {
+		case <-n.done:
+		case <-time.After(time.Second):
+			cancelProcessGroup(n.cmd)
+			<-n.done
+		}
+	})
+}
+
+func cancelProcessGroup(cmd *exec.Cmd) {
+	if cmd != nil && cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+func commandResult(ctx context.Context, cmd *exec.Cmd, runErr error, started time.Time, out, errOut *limitBuffer) Result {
+	result := Result{
+		Stdout: out.String(), Stderr: errOut.String(), DurationMS: time.Since(started).Milliseconds(),
+		StdoutTruncated: out.Truncated(), StderrTruncated: errOut.Truncated(),
+	}
+	if ctx.Err() != nil {
+		result.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		result.Canceled = errors.Is(ctx.Err(), context.Canceled)
+		result.ExitCode = -1
+		return result
+	}
+	if runErr == nil {
+		return result
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		result.ExitCode = exitErr.ExitCode()
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			result.Signal = status.Signal().String()
+		}
+		return result
+	}
+	result.ExitCode = -1
+	return result
 }
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -254,9 +600,14 @@ func buildEnvironment(user, extra map[string]string) []string {
 	for key, value := range extra {
 		values[key] = value
 	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	out := make([]string, 0, len(values))
-	for key, value := range values {
-		out = append(out, key+"="+value)
+	for _, key := range keys {
+		out = append(out, key+"="+values[key])
 	}
 	return out
 }
@@ -287,15 +638,27 @@ func (b *limitBuffer) Write(p []byte) (int, error) {
 	}
 	return n, nil
 }
-func (b *limitBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
-func (b *limitBuffer) Slice(offset int) (string, int, bool) {
+
+func (b *limitBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func (b *limitBuffer) Slice(offset int) (string, int, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	data := b.b.Bytes()
 	if offset < 0 || offset > len(data) {
-		offset = len(data)
+		return "", len(data), b.truncated, errors.New("output cursor is outside retained data")
 	}
-	return string(data[offset:]), len(data), b.truncated
+	return string(data[offset:]), len(data), b.truncated, nil
+}
+
+func (b *limitBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
 }
 
 var _ io.Writer = (*limitBuffer)(nil)

@@ -14,33 +14,41 @@ Cloudflare Tunnel  (cloudflared)
         ▼
 127.0.0.1:8787  workspace-mcp   ← this server (single Go binary)
         │
-        ├── Files: list / read / write / edit
-        ├── Search: bounded literal text search
-        └── Git: status / diff (read-only)
+        ├── Files: bounded read, search, glob, patch, copy/move/delete
+        ├── Commands: optional sandboxed short + async execution
+        └── Git: typed read/write/fetch/pull/push operations
 ```
 
 ## What this is NOT
 
 This is a **capability layer, not a coding harness**. It is not Claude Code, not
-an agent runtime, not an LLM, and contains no agent loop, planner, subagents,
-context manager, or task queue. The MCP client owns all reasoning. There is no
-arbitrary shell execution, no process management, and no generic `git` passthrough.
+an LLM, and contains no agent loop, planner, subagents, or context manager. MCP
+client owns reasoning. Server provides bounded typed operations plus optional
+sandbox execution; it never exposes a generic host shell or generic Git passthrough.
 
-## Tools (exactly seven)
+## Tools
 
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `workspace_list` | `path?`, `depth?` (default 2, max 8) | Lexical directory entries (`path`, `type`, `size`). Skips `.git`, `node_modules`, `vendor`, `.venv`, `target`, `dist`, `build`; never lists symlinks. |
-| `workspace_read` | `path` | Returns `path`, `content`, `size` for one UTF-8 text file (≤1 MiB). Binary files and symlinks are rejected. |
-| `workspace_search` | `query`, `path?`, `max_results?` (default 50, max 200) | Literal case-sensitive line search. Returns `relative_path`, `line_number`, `matching_line`, scan counts, and `truncated`. |
-| `workspace_write` | `path`, `content` | Atomic create/replace of one UTF-8 file (≤1 MiB), creating parent directories. |
-| `workspace_edit` | `path`, `old_text`, `new_text` | Replaces the **exactly one** occurrence of `old_text`; zero or multiple matches fail without mutating. Atomic. |
-| `git_status` | — | Runs fixed `git status --short` in the workspace. Returns `stdout`, `stderr`, `exit_code`. |
-| `git_diff` | — | Runs fixed `git diff --no-ext-diff --no-textconv`. Same result shape. |
+Safe profile is default. It exposes:
 
-All results are bounded (≤1 MiB git output, 512 KiB listing, 15 s tool deadline).
-Every tool result is also serialized as `structuredContent` for clients that
-prefer structured data.
+- Workspace: `workspace_list`, `workspace_read`, `workspace_stat`,
+  `workspace_read_range`, `workspace_glob`, `workspace_search`,
+  `workspace_write`, `workspace_edit`, `workspace_mkdir`, `workspace_delete`,
+  `workspace_move`, `workspace_copy`, `workspace_apply_patch`.
+- Git reads: `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`,
+  `git_remotes`.
+- Introspection: `server_capabilities`.
+
+Agentic gates add:
+
+| Gate / OAuth scope | Tools |
+|---|---|
+| `MCP_ENABLE_EXEC` / `workspace:exec` | `exec_run`, `exec_start`, `exec_status`, `exec_cancel` |
+| `MCP_ENABLE_GIT_WRITE` / `workspace:git-write` | `git_add`, `git_restore`, `git_commit`, `git_branch`, `git_switch`, `git_stash_push`, `git_stash_pop` |
+| `MCP_ENABLE_GIT_NETWORK` / `workspace:git-network` | `git_fetch`, `git_pull`, `git_push` |
+
+Existing tool names and response shapes remain compatible. Results are bounded
+and serialized as `structuredContent`; operation failures remain visible MCP tool
+errors rather than transport failures.
 
 ## Security model
 
@@ -64,8 +72,24 @@ prefer structured data.
 - **State**: OAuth state is AES-256-GCM encrypted in `MCP_STATE_DIR` (0600
   file, 0700 dir, exclusive flock). Secrets, tokens, passwords, file contents,
   and search queries never appear in logs.
-- **What Claude can reach**: only `WORKSPACE_ROOT`. Nothing else — not `/etc`,
-  not `~/.ssh`, not other repositories, not the environment, no shell.
+- **Safe profile reach**: only `WORKSPACE_ROOT`. Nothing else — not `/etc`,
+  not `~/.ssh`, not other repositories, not host environment, no host shell.
+- **Agentic execution**: every command runs through `systemd-run --user --scope`,
+  `prlimit`, and `bubblewrap`; no unsandboxed fallback. Workspace is fd-bound at
+  `/workspace`; runtime trees are read-only; home/tmp/proc/dev are private;
+  environment starts clean; output, time, memory, CPU, PIDs, open files, jobs,
+  and retention are bounded. Network uses a private namespace attached through
+  `slirp4netns` with host loopback blocked.
+- **Credential isolation**: general execution never receives Git credentials.
+  Dedicated network Git commands receive only pre-opened SSH key + pinned
+  `known_hosts`, or an anonymous askpass helper + HTTPS token. Repo-local URL
+  rewrites, proxy/TLS overrides, credential helpers, SSH overrides, hooks,
+  external filters, and unsafe transports are rejected or disabled.
+
+> **Warning:** agentic mode is remote-code-execution-equivalent by design. Code
+> inside the workspace can read and exfiltrate all workspace content through
+> outbound network. Enable it only for an owner-controlled connector and only
+> for workspaces whose contents may be exposed to that connector.
 
 ## Requirements
 
@@ -73,8 +97,10 @@ prefer structured data.
   resolve flags; 5.15 works on stock Ubuntu/WSL2 kernels)
 - Go 1.25 — `./scripts/bootstrap-go.sh` installs it project-locally into
   `.tools/` (verified by SHA-256; no system changes) if your system Go is older
-- `git` on PATH for the git tools
+- `git` on PATH for Git tools
 - `cloudflared` for remote access from Claude.ai
+- Agentic mode only: `bubblewrap`, `slirp4netns`, `prlimit`, cgroup v2, and a
+  usable user systemd manager (`systemd-run --user --scope -- /bin/true`)
 
 ## Build
 
@@ -96,7 +122,50 @@ MCP_MODE=local                             # or public
 
 Public mode additionally requires `MCP_PUBLIC_URL` (the exact HTTPS URL ending
 in `/mcp`), `MCP_ADMIN_PASSWORD`, `MCP_STATE_DIR`, and `MCP_STATE_KEY`
-(`openssl rand -base64 32`).
+(`openssl rand -base64 32`). See `.env.example` for every agentic resource and
+credential setting.
+
+### Agentic profile
+
+Quick Tunnel launcher can explicitly enable all agentic gates:
+
+```bash
+./scripts/start-tunnel.sh --agentic /path/to/project
+```
+
+Launcher fails before startup unless sandbox helpers, cgroup v2, and user
+systemd scope work. Existing invocations without `--agentic` remain safe.
+
+For manual startup, set only capabilities needed:
+
+```text
+MCP_ENABLE_EXEC=true
+MCP_ENABLE_GIT_WRITE=true
+MCP_ENABLE_GIT_NETWORK=true   # requires Git write
+```
+
+Git credentials are optional (`MCP_GIT_CREDENTIAL_MODE=none`). For pushes:
+
+```text
+# SSH
+MCP_GIT_CREDENTIAL_MODE=ssh_key
+MCP_GIT_CREDENTIAL_FILE=/secure/outside/workspace/id_ed25519
+MCP_GIT_KNOWN_HOSTS_FILE=/secure/outside/workspace/known_hosts
+
+# or HTTPS token
+MCP_GIT_CREDENTIAL_MODE=https_token
+MCP_GIT_CREDENTIAL_FILE=/secure/outside/workspace/token
+
+MCP_GIT_ALLOWED_REMOTES=origin
+```
+
+Credential files must be regular, single-linked, server-owned, mode `0600` or
+stricter, and outside workspace. Tokens contain exactly one non-empty UTF-8
+line. SSH mode requires pinned `known_hosts`; SSH agent forwarding is never used.
+
+Adding scopes changes OAuth consent. Delete and re-add existing Claude.ai
+connector after enabling agentic gates. Async jobs live in memory, expire after
+configured TTL, and disappear on server restart.
 
 ## Local development (no auth)
 
@@ -187,8 +256,8 @@ reachable. Optional services: `deploy/systemd/workspace-mcp.service` (expects
    `https://mcp.example.com/mcp`).
 4. Claude discovers the OAuth setup automatically (protected-resource metadata
    → DCR). Sign in with your `MCP_ADMIN_PASSWORD` and approve the consent page.
-5. The connector shows the seven tools; enable it in a chat and try:
-   "list the project files", "read main.go", "search for Greet",
+5. Connector shows safe-profile tools plus any enabled agentic tools; enable it
+   in a chat and try: "list project files", "read main.go", "search for Greet",
    "write a test file", "edit it", "show git status and diff".
 
 Quick Tunnel users: after each tunnel restart, delete and re-add the connector
@@ -202,11 +271,15 @@ with the new URL (the old URL's OAuth state is invalidated by design).
 .tools/go/bin/go vet ./...
 ```
 
-Security cases covered in CI-style tests: path traversal, absolute paths,
-outbound/internal/nested symlinks, hard links, `.git` access, binary and
-oversized files, atomic-write cleanup, edit occurrence rules, PKCE/redirect/
-resource mismatches, code replay, refresh rotation + replay revocation,
-CSRF, rate limits, origin validation, panic recovery.
+Security cases covered in CI-style tests: traversal/absolute paths, symlinks,
+hard links, `.git`, binary/oversized files, atomic writes, capped recursive
+operations, patch prevalidation, Git option/ref/remote validation, credential
+owner/mode/link checks and path replacement, async ownership/cursors/capacity,
+PKCE/redirect/resource mismatches, code replay, refresh replay revocation,
+OAuth scopes, CSRF, rate limits, origin validation, and panic recovery.
+
+Live sandbox/network integration tests require agentic dependencies. If absent,
+configuration fails closed before agentic startup; safe-profile tests still run.
 
 ## Troubleshooting
 
@@ -221,6 +294,9 @@ CSRF, rate limits, origin validation, panic recovery.
 | Login or consent form fails | Password, expired browser session, or CSRF validation failed. Restart the authorization flow from the connector. |
 | 429 responses | Rate limiting (300 req/min per IP); check for tight client retry loops. |
 | WSL2: service not running after Windows restart | Enable systemd in `/etc/wsl.conf` or add the start command to logon automation. |
+| Agentic startup says helper unavailable | Install `bubblewrap`, `slirp4netns`, and `util-linux` (`prlimit`), then verify user namespaces and `systemd-run --user --scope -- /bin/true`. |
+| Agentic startup says cgroup unavailable | Require cgroup v2 and user-systemd delegation. On WSL2 enable systemd, run `wsl --shutdown`, then retry from a fresh distro session. |
+| Git credential rejected | Credential must be outside workspace, regular, single-linked, owned by server UID, and mode `0600` or stricter. |
 
 ## What must remain running locally?
 

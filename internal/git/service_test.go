@@ -79,6 +79,23 @@ func TestNonRepository(t *testing.T) {
 	}
 }
 
+func TestNewAgenticNilRunner(t *testing.T) {
+	dir := t.TempDir()
+	r, err := workspace.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	s, err := NewAgentic(r, nil)
+	if err != nil {
+		t.Fatalf("NewAgentic with nil runner: %v", err)
+	}
+	defer s.Close()
+	if s.runner != nil {
+		t.Fatal("expected nil runner")
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || indexOf(s, sub) >= 0)
 }
