@@ -166,14 +166,46 @@ if [ -n "$QUICK_MISSING" ] || [ -n "$AGENTIC_MISSING" ]; then
 fi
 
 if [ "$AGENTIC" = true ]; then
-  if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
-    echo "--agentic requires cgroup v2. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
+  _uid="$(id -u)"
+  if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -n "$_uid" ] && [ -d "/run/user/$_uid" ]; then
+    XDG_RUNTIME_DIR="/run/user/$_uid"
+    export XDG_RUNTIME_DIR
+  fi
+  unset _uid
+
+  _has_cgroup_v2=false
+  if [ -f /sys/fs/cgroup/cgroup.controllers ] || [ -f /sys/fs/cgroup/unified/cgroup.controllers ]; then
+    _has_cgroup_v2=true
+  fi
+  _init_comm=""
+  if command -v ps >/dev/null 2>&1; then
+    _init_comm="$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+
+  if [ "$_has_cgroup_v2" != true ]; then
+    if [ "$_init_comm" = "systemd" ]; then
+      echo "--agentic requires cgroup v2, but it is not mounted on this system (PID 1 is already systemd)." >&2
+      echo "This host uses legacy cgroup v1 or lacks unified cgroups. No change to /etc/wsl.conf is needed." >&2
+    else
+      echo "--agentic requires cgroup v2. On WSL2, enable systemd in /etc/wsl.conf ([boot] systemd=true), run 'wsl --shutdown' from Windows, then retry." >&2
+    fi
+    echo "Tip: Safe profile without --agentic is fully functional and requires no cgroup configuration." >&2
+    unset _has_cgroup_v2 _init_comm
     exit 1
   fi
+
   if ! systemd-run --user --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
-    echo "--agentic requires a usable user systemd manager and delegated cgroup scope. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
+    if [ "$_init_comm" = "systemd" ]; then
+      echo "--agentic requires a working user systemd manager (systemd-run --user failed; XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset})." >&2
+      echo "Try running from a login shell; no change to /etc/wsl.conf is needed since systemd is already active." >&2
+    else
+      echo "--agentic requires a usable user systemd manager and delegated cgroup scope. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
+    fi
+    echo "Tip: Safe profile without --agentic is fully functional and requires no cgroup configuration." >&2
+    unset _has_cgroup_v2 _init_comm
     exit 1
   fi
+  unset _has_cgroup_v2 _init_comm
   export MCP_ENABLE_EXEC=true
   export MCP_ENABLE_GIT_WRITE=true
   export MCP_ENABLE_GIT_NETWORK=true
