@@ -35,25 +35,6 @@ fi
 WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd)"
 export WORKSPACE_ROOT
 
-if [ "$FOREGROUND" != true ] && [ -z "${TMUX:-}" ]; then
-  if command -v tmux >/dev/null 2>&1; then
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-      echo "workspace-mcp is already running in tmux session '$SESSION_NAME'."
-      echo "Attach:  tmux attach -t $SESSION_NAME"
-      echo "Stop:    tmux kill-session -t $SESSION_NAME"
-      exit 0
-    fi
-    AGENTIC_ARG=""
-    [ "$AGENTIC" = true ] && AGENTIC_ARG=" --agentic"
-    tmux new-session -d -s "$SESSION_NAME" "exec '$0' --fg$AGENTIC_ARG '$WORKSPACE_ROOT'"
-    echo "Started in tmux session '$SESSION_NAME' (stays running when you log out of this shell)."
-    echo "Attach:  tmux attach -t $SESSION_NAME"
-    echo "Stop:    tmux kill-session -t $SESSION_NAME"
-    exit 0
-  fi
-  echo "tmux not found; running in foreground instead (Ctrl+C stops everything)." >&2
-fi
-
 for command_name in cloudflared openssl curl python3 sha256sum tar; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "$command_name not found; install it before starting the Quick Tunnel" >&2
@@ -79,6 +60,51 @@ if [ "$AGENTIC" = true ]; then
   export MCP_ENABLE_EXEC=true
   export MCP_ENABLE_GIT_WRITE=true
   export MCP_ENABLE_GIT_NETWORK=true
+fi
+
+if [ "$FOREGROUND" != true ] && [ -z "${TMUX:-}" ]; then
+  if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+      echo "workspace-mcp is already running in tmux session '$SESSION_NAME'."
+      BOX="$(tmux capture-pane -pt "$SESSION_NAME" 2>/dev/null | sed -n '/===/,/===/p' || true)"
+      if [ -n "$BOX" ]; then
+        printf '\n%s\n\n' "$BOX"
+      fi
+      echo "Attach:  tmux attach -t $SESSION_NAME"
+      echo "Stop:    tmux kill-session -t $SESSION_NAME"
+      exit 0
+    fi
+    AGENTIC_ARG=""
+    [ "$AGENTIC" = true ] && AGENTIC_ARG=" --agentic"
+    tmux new-session -d -s "$SESSION_NAME" "exec '$0' --fg$AGENTIC_ARG '$WORKSPACE_ROOT'"
+    echo "Starting Quick Tunnel in background (tmux session '$SESSION_NAME')..."
+    echo "Waiting for connector URL and credentials..."
+    i=0
+    BOX=""
+    while [ "$i" -lt 60 ]; do
+      if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        echo "Server failed to start; session exited." >&2
+        exit 1
+      fi
+      PANE="$(tmux capture-pane -pt "$SESSION_NAME" 2>/dev/null || true)"
+      if echo "$PANE" | grep -q "Claude.ai connector URL"; then
+        BOX="$(echo "$PANE" | sed -n '/===/,/===/p')"
+        [ -n "$BOX" ] && break
+      fi
+      i=$((i + 1))
+      sleep 1
+    done
+    if [ -n "$BOX" ]; then
+      printf '\n%s\n\n' "$BOX"
+    else
+      echo "Tunnel started, but could not capture URL yet."
+    fi
+    echo "Started in tmux session '$SESSION_NAME' (stays running when you log out of this shell)."
+    echo "Attach:  tmux attach -t $SESSION_NAME"
+    echo "Stop:    tmux kill-session -t $SESSION_NAME"
+    exit 0
+  fi
+  echo "tmux not found; running in foreground instead (Ctrl+C stops everything)." >&2
 fi
 
 export MCP_MODE=public
