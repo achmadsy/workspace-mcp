@@ -69,20 +69,100 @@ if [ -n "$QUICK_MISSING" ] || [ -n "$AGENTIC_MISSING" ]; then
   [ -n "$QUICK_MISSING" ] && echo "  Quick Tunnel: $QUICK_MISSING" >&2
   [ -n "$AGENTIC_MISSING" ] && echo "  Agentic mode: $AGENTIC_MISSING" >&2
   echo "" >&2
-  echo "Install the missing dependencies, then rerun this command." >&2
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    echo "  cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" >&2
+
+  OS_ID=""
+  OS_ID_LIKE=""
+  if [ -r /etc/os-release ]; then
+    OS_ID="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    OS_ID_LIKE="$(. /etc/os-release && printf '%s' "${ID_LIKE:-}")"
   fi
-  if [ -n "$BASE_PACKAGES" ]; then
-    echo "  Debian/Ubuntu/WSL2: sudo apt-get update && sudo apt-get install -y $BASE_PACKAGES" >&2
+  case " $OS_ID $OS_ID_LIKE " in
+    *" debian "*|*" ubuntu "*) ;;
+    *)
+      echo "Automatic installation supports Debian, Ubuntu, and WSL2 only." >&2
+      exit 1
+      ;;
+  esac
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "Automatic installation requires apt-get." >&2
+    exit 1
   fi
+  if [ ! -t 0 ]; then
+    echo "Run this command in an interactive terminal to approve installation." >&2
+    exit 1
+  fi
+
+  printf "Install missing dependencies now? [y/N] " >&2
+  answer=""
+  read -r answer || answer=""
+  case "$answer" in
+    [yY]|[yY][eE][sS]) ;;
+    *) exit 1 ;;
+  esac
+
+  run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+      "$@"
+    else
+      sudo "$@"
+    fi
+  }
+
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "sudo is required to install system packages." >&2
+      exit 1
+    fi
+    run_privileged true
+  fi
+
+  PACKAGES="$BASE_PACKAGES"
   if [ -n "$AGENTIC_PACKAGES" ]; then
-    echo "  Agentic packages: sudo apt-get update && sudo apt-get install -y $AGENTIC_PACKAGES" >&2
+    PACKAGES="${PACKAGES}${PACKAGES:+ }$AGENTIC_PACKAGES"
   fi
-  if [ "$AGENTIC" = true ] && ! command -v systemd-run >/dev/null 2>&1; then
-    echo "  WSL2 also needs systemd enabled in /etc/wsl.conf; then run 'wsl --shutdown' from Windows." >&2
+  if [ -n "$PACKAGES" ]; then
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update
+    # Package names are assembled from the fixed command mappings above.
+    # shellcheck disable=SC2086
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y $PACKAGES
   fi
-  exit 1
+
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    run_privileged mkdir -p --mode=0755 /usr/share/keyrings
+    CLOUDFLARE_KEY="$(mktemp)"
+    if ! curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o "$CLOUDFLARE_KEY"; then
+      rm -f "$CLOUDFLARE_KEY"
+      echo "Failed to download the Cloudflare package signing key." >&2
+      exit 1
+    fi
+    if ! run_privileged tee /usr/share/keyrings/cloudflare-main.gpg < "$CLOUDFLARE_KEY" >/dev/null; then
+      rm -f "$CLOUDFLARE_KEY"
+      exit 1
+    fi
+    rm -f "$CLOUDFLARE_KEY"
+    printf '%s\n' "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" |
+      run_privileged tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+  fi
+
+  STILL_MISSING=""
+  for command_name in cloudflared openssl curl python3 sha256sum tar git; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      STILL_MISSING="${STILL_MISSING}${STILL_MISSING:+ }$command_name"
+    fi
+  done
+  if [ "$AGENTIC" = true ]; then
+    for command_name in bwrap slirp4netns systemd-run prlimit; do
+      if ! command -v "$command_name" >/dev/null 2>&1; then
+        STILL_MISSING="${STILL_MISSING}${STILL_MISSING:+ }$command_name"
+      fi
+    done
+  fi
+  if [ -n "$STILL_MISSING" ]; then
+    echo "Dependencies remain unavailable after installation: $STILL_MISSING" >&2
+    exit 1
+  fi
 fi
 
 if [ "$AGENTIC" = true ]; then

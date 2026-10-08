@@ -139,6 +139,12 @@ a client can tell.
 - Agentic mode only: `bubblewrap`, `slirp4netns`, `prlimit`, cgroup v2, and a
   usable user systemd manager (`systemd-run --user --scope -- /bin/true`)
 
+On Debian, Ubuntu, and WSL2, the Quick Tunnel launcher can install missing
+`cloudflared`, base, and `--agentic` packages after one interactive confirmation.
+It runs package operations directly as root or through `sudo`; when dependencies
+are missing, noninteractive launches and declined installation exit without
+changing the system.
+
 ## Build
 
 ```bash
@@ -236,12 +242,16 @@ run in the calling terminal instead (Ctrl+C stops both processes). Set a custom
 session name with `WORKSPACE_MCP_SESSION` or socket name with
 `WORKSPACE_MCP_TMUX_SOCKET`.
 
-This one command checks startup dependencies first and prints install guidance
-for anything missing, including `cloudflared` and all `--agentic` helpers. It
-then bootstraps Go if needed, builds the server, generates or reuses secure OAuth
-credentials, starts `cloudflared`, prints the exact connector URL
-(`https://<random>.trycloudflare.com/mcp`) and the admin login password, then
-starts the server.
+This one command checks startup dependencies first. On Debian, Ubuntu, and
+WSL2, it reports every missing dependency—including `cloudflared` and all
+`--agentic` helpers—and asks once whether to install them with `apt-get`.
+Approved installs run directly as root or through `sudo`, configure Cloudflare's
+official apt repository when needed, revalidate every command, and continue in
+the same run. Declining or running without an interactive terminal exits without
+installing anything. The launcher then bootstraps Go if needed, builds the
+server, generates or reuses secure OAuth credentials, starts `cloudflared`,
+prints the exact connector URL (`https://<random>.trycloudflare.com/mcp`) and the
+admin login password, then starts the server.
 
 Credentials and encrypted OAuth state live under
 `${XDG_DATA_HOME:-$HOME/.local/share}/workspace-mcp`: the directory is mode
