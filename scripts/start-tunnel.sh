@@ -146,6 +146,15 @@ if [ -n "$QUICK_MISSING" ] || [ -n "$AGENTIC_MISSING" ]; then
     run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
   fi
 
+  if [ "$AGENTIC" = true ]; then
+    if command -v loginctl >/dev/null 2>&1; then
+      run_privileged loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      run_privileged systemctl start "user@$(id -u).service" >/dev/null 2>&1 || true
+    fi
+  fi
+
   STILL_MISSING=""
   for command_name in cloudflared openssl curl python3 sha256sum tar git; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -196,8 +205,26 @@ if [ "$AGENTIC" = true ]; then
 
   if ! systemd-run --user --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
     if [ "$_init_comm" = "systemd" ]; then
+      if [ "$(id -u)" -eq 0 ]; then
+        command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
+        command -v systemctl >/dev/null 2>&1 && systemctl start "user@$(id -u).service" >/dev/null 2>&1 || true
+      elif command -v sudo >/dev/null 2>&1; then
+        command -v loginctl >/dev/null 2>&1 && sudo loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
+        command -v systemctl >/dev/null 2>&1 && sudo systemctl start "user@$(id -u).service" >/dev/null 2>&1 || true
+      fi
+      _uid="$(id -u)"
+      if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -n "$_uid" ] && [ -d "/run/user/$_uid" ]; then
+        XDG_RUNTIME_DIR="/run/user/$_uid"
+        export XDG_RUNTIME_DIR
+      fi
+      unset _uid
+    fi
+  fi
+
+  if ! systemd-run --user --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
+    if [ "$_init_comm" = "systemd" ]; then
       echo "--agentic requires a working user systemd manager (systemd-run --user failed; XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset})." >&2
-      echo "Try running from a login shell; no change to /etc/wsl.conf is needed since systemd is already active." >&2
+      echo "Try running 'sudo loginctl enable-linger \$USER' or start from a login shell." >&2
     else
       echo "--agentic requires a usable user systemd manager and delegated cgroup scope. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
     fi
