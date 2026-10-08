@@ -39,6 +39,7 @@ type searchInput struct {
 	CaseInsensitive bool     `json:"case_insensitive,omitempty" jsonschema:"Match without case sensitivity"`
 	Include         []string `json:"include,omitempty" jsonschema:"Optional file glob allowlist"`
 	ContextLines    int      `json:"context_lines,omitempty" jsonschema:"Lines before and after each match (0-20)"`
+	IncludeIgnored  bool     `json:"include_ignored,omitempty" jsonschema:"Also search ignored directories (node_modules, vendor, .tools, root .gitignore entries); default false"`
 }
 type writeInput struct {
 	Path    string `json:"path" jsonschema:"Relative destination path"`
@@ -122,11 +123,47 @@ type capabilitiesResult struct {
 	Exec       bool `json:"exec"`
 	GitWrite   bool `json:"git_write"`
 	GitNetwork bool `json:"git_network"`
-	Limits     struct {
+	// ExecNetwork reports whether sandboxed exec commands get a private network
+	// (slirp4netns). It does not restrict LAN, RFC1918 or link-local addresses.
+	ExecNetwork bool `json:"exec_network"`
+	// GitCredentialMode is the mode name only ("none", "ssh", "https"), never paths.
+	GitCredentialMode string `json:"git_credential_mode,omitempty"`
+	Limits            struct {
 		MaxFileBytes  int `json:"max_file_bytes"`
 		MaxExecOutput int `json:"max_exec_output"`
 		MaxExecJobs   int `json:"max_exec_jobs"`
+		// Execution limits are reported only when exec is enabled.
+		ExecTimeoutMS    int64  `json:"exec_timeout_ms,omitempty"`
+		ExecJobTimeoutMS int64  `json:"exec_job_timeout_ms,omitempty"`
+		ExecJobTTLSecs   int64  `json:"exec_job_ttl_seconds,omitempty"`
+		ExecMemoryBytes  uint64 `json:"exec_memory_bytes,omitempty"`
+		ExecMaxProcesses uint64 `json:"exec_max_processes,omitempty"`
+		ExecMaxFileBytes uint64 `json:"exec_max_file_bytes,omitempty"`
+		ExecCPUSeconds   uint64 `json:"exec_cpu_seconds,omitempty"`
 	} `json:"limits"`
+}
+
+// buildCapabilities reports enabled gates and public limits. It never includes
+// paths or secrets; credential mode is only the mode name.
+func buildCapabilities(cfg config.Config) capabilitiesResult {
+	out := capabilitiesResult{Exec: cfg.EnableExec, GitWrite: cfg.EnableGitWrite, GitNetwork: cfg.EnableGitNetwork}
+	out.Limits.MaxFileBytes = limits.MaxFileBytes
+	out.Limits.MaxExecOutput = cfg.ExecMaxOutput
+	out.Limits.MaxExecJobs = cfg.ExecMaxJobs
+	if cfg.EnableExec {
+		out.ExecNetwork = true
+		out.Limits.ExecTimeoutMS = cfg.ExecTimeout.Milliseconds()
+		out.Limits.ExecJobTimeoutMS = cfg.ExecJobTimeout.Milliseconds()
+		out.Limits.ExecJobTTLSecs = int64(cfg.ExecJobTTL / time.Second)
+		out.Limits.ExecMemoryBytes = cfg.ExecMemoryBytes
+		out.Limits.ExecMaxProcesses = cfg.ExecMaxProcesses
+		out.Limits.ExecMaxFileBytes = cfg.ExecMaxFileBytes
+		out.Limits.ExecCPUSeconds = cfg.ExecCPUSeconds
+	}
+	if cfg.EnableGitNetwork {
+		out.GitCredentialMode = cfg.GitCredentialMode
+	}
+	return out
 }
 
 func registerTools(s *mcp.Server, cfg config.Config, ws *workspace.Root, gs *gitservice.Service, runner *sandboxexec.Runner, jobs *sandboxexec.Jobs) {
@@ -135,11 +172,7 @@ func registerTools(s *mcp.Server, cfg config.Config, ws *workspace.Root, gs *git
 
 	mcp.AddTool(s, tool("server_capabilities", "Report enabled capability gates and public numeric limits.", "Show server capabilities", readOnly, &nonDestructive, true, &closed),
 		func(context.Context, *mcp.CallToolRequest, noInput) (*mcp.CallToolResult, capabilitiesResult, error) {
-			out := capabilitiesResult{Exec: cfg.EnableExec, GitWrite: cfg.EnableGitWrite, GitNetwork: cfg.EnableGitNetwork}
-			out.Limits.MaxFileBytes = limits.MaxFileBytes
-			out.Limits.MaxExecOutput = cfg.ExecMaxOutput
-			out.Limits.MaxExecJobs = cfg.ExecMaxJobs
-			return nil, out, nil
+			return nil, buildCapabilities(cfg), nil
 		})
 	mcp.AddTool(s, tool("workspace_list", "List bounded workspace entries in deterministic lexical order. Symlinks and .git are never exposed.", "List workspace entries", readOnly, &nonDestructive, true, &closed),
 		func(_ context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, workspace.ListResult, error) {
@@ -161,8 +194,8 @@ func registerTools(s *mcp.Server, cfg config.Config, ws *workspace.Root, gs *git
 			out, err := ws.ReadRange(in.Path, in.Offset, in.Length)
 			return nil, out, err
 		})
-	mcp.AddTool(s, tool("workspace_glob", "Match a bounded deterministic slash-separated glob below a workspace directory.", "Glob workspace paths", readOnly, &nonDestructive, true, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in globInput) (*mcp.CallToolResult, []string, error) {
+	mcp.AddTool(s, tool("workspace_glob", "Match a bounded deterministic slash-separated glob below a workspace directory. Returns paths plus a truncated flag and reason when a limit was hit.", "Glob workspace paths", readOnly, &nonDestructive, true, &closed),
+		func(_ context.Context, _ *mcp.CallToolRequest, in globInput) (*mcp.CallToolResult, workspace.GlobResult, error) {
 			out, err := ws.Glob(in.Pattern, in.Path)
 			return nil, out, err
 		})
@@ -170,42 +203,49 @@ func registerTools(s *mcp.Server, cfg config.Config, ws *workspace.Root, gs *git
 		func(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, workspace.SearchResult, error) {
 			ctx, cancel := context.WithTimeout(ctx, limits.ToolTimeout)
 			defer cancel()
-			out, err := ws.SearchWithOptions(ctx, in.Query, workspace.SearchOptions{Path: in.Path, MaxResults: in.MaxResults, CaseInsensitive: in.CaseInsensitive, Include: in.Include, ContextLines: in.ContextLines})
+			out, err := ws.SearchWithOptions(ctx, in.Query, workspace.SearchOptions{Path: in.Path, MaxResults: in.MaxResults, CaseInsensitive: in.CaseInsensitive, Include: in.Include, ContextLines: in.ContextLines, IncludeIgnored: in.IncludeIgnored})
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_write", "Atomically create or replace one UTF-8 workspace file.", "Write workspace file", false, &destructive, false, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in writeInput) (*mcp.CallToolResult, workspace.WriteResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in writeInput) (*mcp.CallToolResult, workspace.WriteResult, error) {
 			out, err := ws.Write(in.Path, in.Content)
+			auditWorkspace(req, cfg, "workspace_write", err, "path", in.Path, "bytes", len(in.Content), "size", out.Size, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_edit", "Atomically replace exactly one occurrence in one UTF-8 workspace file.", "Edit workspace file", false, &destructive, false, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, workspace.EditResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, workspace.EditResult, error) {
 			out, err := ws.Edit(in.Path, in.OldText, in.NewText)
+			auditWorkspace(req, cfg, "workspace_edit", err, "path", in.Path, "old_bytes", len(in.OldText), "new_bytes", len(in.NewText), "size", out.Size, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_mkdir", "Create one safe workspace directory and optionally missing parents.", "Create workspace directory", false, &nonDestructive, true, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in mkdirInput) (*mcp.CallToolResult, workspace.MutationResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in mkdirInput) (*mcp.CallToolResult, workspace.MutationResult, error) {
 			out, err := ws.Mkdir(in.Path, in.Parents)
+			auditWorkspace(req, cfg, "workspace_mkdir", err, "path", in.Path, "parents", in.Parents, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_delete", "Delete one safe file or a fully prevalidated bounded directory tree.", "Delete workspace path", false, &destructive, true, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in deleteInput) (*mcp.CallToolResult, workspace.MutationResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in deleteInput) (*mcp.CallToolResult, workspace.MutationResult, error) {
 			out, err := ws.Delete(in.Path, in.Recursive)
+			auditWorkspace(req, cfg, "workspace_delete", err, "path", in.Path, "recursive", in.Recursive, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_move", "Atomically move one safe file or directory inside the workspace.", "Move workspace path", false, &destructive, false, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, workspace.MoveResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, workspace.MoveResult, error) {
 			out, err := ws.Move(in.Source, in.Destination, in.Overwrite)
+			auditWorkspace(req, cfg, "workspace_move", err, "source", in.Source, "destination", in.Destination, "overwrite", in.Overwrite, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_copy", "Atomically copy one regular single-linked file inside the workspace.", "Copy workspace file", false, &nonDestructive, true, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, workspace.MoveResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, workspace.MoveResult, error) {
 			out, err := ws.Copy(in.Source, in.Destination, in.Overwrite)
+			auditWorkspace(req, cfg, "workspace_copy", err, "source", in.Source, "destination", in.Destination, "overwrite", in.Overwrite, "changed", out.Changed)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("workspace_apply_patch", "Prevalidate and apply a unified diff to existing UTF-8 workspace files.", "Apply workspace patch", false, &destructive, false, &closed),
-		func(_ context.Context, _ *mcp.CallToolRequest, in patchInput) (*mcp.CallToolResult, workspace.PatchResult, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in patchInput) (*mcp.CallToolResult, workspace.PatchResult, error) {
 			out, err := ws.ApplyPatch(in.Patch)
+			auditWorkspace(req, cfg, "workspace_apply_patch", err, "patch_bytes", len(in.Patch), "files_changed", out.FilesChanged, "path_count", len(out.Paths))
 			return nil, out, err
 		})
 
@@ -376,6 +416,14 @@ func registerGitNetworkTools(s *mcp.Server, cfg config.Config, gs *gitservice.Se
 
 func auditGit(req *mcp.CallToolRequest, toolName string, out gitservice.Result, err error, attrs ...any) {
 	attrs = append(attrs, "exit_code", out.ExitCode, "stdout_truncated", out.StdoutTruncated, "stderr_truncated", out.StderrTruncated, "error", err != nil)
+	auditTool(req, toolName, attrs...)
+}
+
+// auditWorkspace records a mutating workspace tool call. Callers pass paths and
+// byte counts only, never file content, edit text or patch text.
+func auditWorkspace(req *mcp.CallToolRequest, cfg config.Config, toolName string, err error, attrs ...any) {
+	attrs = append([]any{"client_id", toolOwner(cfg, req)}, attrs...)
+	attrs = append(attrs, "error", err != nil)
 	auditTool(req, toolName, attrs...)
 }
 

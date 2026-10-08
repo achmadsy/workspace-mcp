@@ -23,21 +23,27 @@ const (
 )
 
 type JobStatus struct {
-	ID              string   `json:"id"`
-	State           JobState `json:"state"`
-	Stdout          string   `json:"stdout"`
-	Stderr          string   `json:"stderr"`
-	StdoutCursor    int      `json:"stdout_cursor"`
-	StderrCursor    int      `json:"stderr_cursor"`
-	StdoutTruncated bool     `json:"stdout_truncated"`
-	StderrTruncated bool     `json:"stderr_truncated"`
-	ExitCode        int      `json:"exit_code,omitempty"`
-	Signal          string   `json:"signal,omitempty"`
-	DurationMS      int64    `json:"duration_ms,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	CreatedAt       string   `json:"created_at"`
-	StartedAt       string   `json:"started_at,omitempty"`
-	CompletedAt     string   `json:"completed_at,omitempty"`
+	ID    string   `json:"id"`
+	State JobState `json:"state"`
+	// Stdout and Stderr hold output after the supplied cursors. Cursors are
+	// absolute stream offsets; once more than the retention limit has been
+	// produced the oldest bytes are dropped and reported in the *DroppedBytes
+	// fields. A cursor older than the retained window resumes at its start.
+	Stdout             string `json:"stdout"`
+	Stderr             string `json:"stderr"`
+	StdoutCursor       int    `json:"stdout_cursor"`
+	StderrCursor       int    `json:"stderr_cursor"`
+	StdoutTruncated    bool   `json:"stdout_truncated"`
+	StderrTruncated    bool   `json:"stderr_truncated"`
+	StdoutDroppedBytes int    `json:"stdout_dropped_bytes,omitempty"`
+	StderrDroppedBytes int    `json:"stderr_dropped_bytes,omitempty"`
+	ExitCode           int    `json:"exit_code,omitempty"`
+	Signal             string `json:"signal,omitempty"`
+	DurationMS         int64  `json:"duration_ms,omitempty"`
+	Error              string `json:"error,omitempty"`
+	CreatedAt          string `json:"created_at"`
+	StartedAt          string `json:"started_at,omitempty"`
+	CompletedAt        string `json:"completed_at,omitempty"`
 }
 
 type Jobs struct {
@@ -92,8 +98,8 @@ func (m *Jobs) Start(owner string, request Request) (JobStatus, error) {
 	now := m.now()
 	j := &job{
 		id: id, owner: owner, state: JobQueued, createdAt: now, cancel: cancel,
-		stdout: &limitBuffer{limit: m.runner.cfg.ExecMaxOutput},
-		stderr: &limitBuffer{limit: m.runner.cfg.ExecMaxOutput},
+		stdout: &limitBuffer{limit: m.runner.cfg.ExecMaxOutput, mode: bufferRolling},
+		stderr: &limitBuffer{limit: m.runner.cfg.ExecMaxOutput, mode: bufferRolling},
 	}
 
 	m.mu.Lock()
@@ -207,6 +213,7 @@ func (m *Jobs) statusLocked(j *job, stdoutCursor, stderrCursor int) (JobStatus, 
 		Stdout: stdout, Stderr: stderr,
 		StdoutCursor: stdoutNext, StderrCursor: stderrNext,
 		StdoutTruncated: stdoutTruncated, StderrTruncated: stderrTruncated,
+		StdoutDroppedBytes: j.stdout.Dropped(), StderrDroppedBytes: j.stderr.Dropped(),
 		ExitCode: j.result.ExitCode, Signal: j.result.Signal, DurationMS: j.result.DurationMS,
 		CreatedAt: j.createdAt.UTC().Format(time.RFC3339Nano),
 	}

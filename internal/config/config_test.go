@@ -194,6 +194,47 @@ func TestConfigValidationEdgeCases(t *testing.T) {
 	}
 }
 
+func TestAgenticResourceDefaultsAndBounds(t *testing.T) {
+	dir := t.TempDir()
+	setEnv(t, baseEnvs(dir))
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// File size is an independent limit, not derived from the output limit.
+	if c.ExecMaxFileBytes != 1<<30 || c.ExecMemoryBytes != 2<<30 || c.ExecMaxProcesses != 512 {
+		t.Fatalf("unexpected defaults: file=%d memory=%d procs=%d", c.ExecMaxFileBytes, c.ExecMemoryBytes, c.ExecMaxProcesses)
+	}
+	for k, v := range map[string]string{
+		"MCP_EXEC_MAX_FILE_BYTES": "1024",   // below 1 MiB
+		"MCP_EXEC_MEMORY_BYTES":   "banana", // unparsable input must not wrap to a huge limit
+		"MCP_EXEC_MAX_PROCESSES":  "-5",
+	} {
+		env := baseEnvs(dir)
+		env[k] = v
+		setEnv(t, env)
+		if _, err := Load(); err == nil {
+			t.Fatalf("invalid %s=%s accepted", k, v)
+		}
+		os.Unsetenv(k)
+	}
+}
+
+func TestEnvBoolDefault(t *testing.T) {
+	t.Setenv("MCP_TEST_BOOL", "")
+	if !envBoolDefault("MCP_TEST_BOOL", true) || envBoolDefault("MCP_TEST_BOOL", false) {
+		t.Fatal("unset variable must return the default")
+	}
+	t.Setenv("MCP_TEST_BOOL", "false")
+	if envBoolDefault("MCP_TEST_BOOL", true) {
+		t.Fatal("explicit false ignored")
+	}
+	t.Setenv("MCP_TEST_BOOL", "not-a-bool")
+	if !envBoolDefault("MCP_TEST_BOOL", true) {
+		t.Fatal("invalid value must fall back to the default")
+	}
+}
+
 func TestSecureCredentialFile(t *testing.T) {
 	ws := t.TempDir()
 	outside := t.TempDir()

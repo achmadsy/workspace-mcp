@@ -22,6 +22,9 @@ type SearchOptions struct {
 	CaseInsensitive bool
 	Include         []string
 	ContextLines    int
+	// IncludeIgnored also searches directories skipped by default (built-in
+	// dependency/build directories and simple patterns from the root .gitignore).
+	IncludeIgnored bool
 }
 
 type SearchMatch struct {
@@ -37,7 +40,14 @@ type SearchResult struct {
 	FilesScanned int           `json:"files_scanned"`
 	BytesScanned int64         `json:"bytes_scanned"`
 	Truncated    bool          `json:"truncated"`
+	// TruncatedReason says why the search stopped early, so an empty result is
+	// not mistaken for "no match".
+	TruncatedReason string `json:"truncated_reason,omitempty"`
+	// SkippedDirs lists (a bounded sample of) directories skipped as ignored.
+	SkippedDirs []string `json:"skipped_dirs,omitempty"`
 }
+
+const maxSkippedDirs = 25
 
 func (r *Root) Search(ctx context.Context, query, searchPath string, maxResults int) (SearchResult, error) {
 	return r.SearchWithOptions(ctx, query, SearchOptions{Path: searchPath, MaxResults: maxResults})
@@ -97,9 +107,34 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 		return result, err
 	}
 
+	skipIgnored := !options.IncludeIgnored
+	var rules *ignoreRules
+	if skipIgnored {
+		rules = r.loadIgnoreRules()
+		if rules.coversPath(options.Path) {
+			// The caller asked for a location inside an ignored directory.
+			skipIgnored = false
+		}
+	}
+	truncate := func(reason string) {
+		result.Truncated = true
+		if result.TruncatedReason == "" {
+			result.TruncatedReason = reason
+		}
+	}
+	skipDir := func(rel, name string) bool {
+		if !skipIgnored || (!ignoredDirectory(name) && !rules.matches(rel, name, true)) {
+			return false
+		}
+		if len(result.SkippedDirs) < maxSkippedDirs {
+			result.SkippedDirs = append(result.SkippedDirs, rel)
+		}
+		return true
+	}
+
 	scanFile := func(fd int, rel string) error {
 		if result.FilesScanned >= limits.MaxSearchFiles || result.BytesScanned >= limits.MaxSearchBytes {
-			result.Truncated = true
+			truncate("scan budget exhausted (file or byte limit); narrow `path` or use `include`")
 			return nil
 		}
 		if !matchesIncludes(rel, options.Include) {
@@ -126,7 +161,7 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 			b := scanner.Bytes()
 			result.BytesScanned += int64(len(b) + 1)
 			if result.BytesScanned > limits.MaxSearchBytes {
-				result.Truncated = true
+				truncate("scan budget exhausted (file or byte limit); narrow `path` or use `include`")
 				return nil
 			}
 			if bytes.IndexByte(b, 0) >= 0 || !utf8.Valid(b) {
@@ -147,7 +182,7 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 				continue
 			}
 			if len(result.Matches) >= options.MaxResults {
-				result.Truncated = true
+				truncate("max_results reached; raise max_results or narrow the query")
 				return nil
 			}
 			match := SearchMatch{RelativePath: rel, LineNumber: i + 1, MatchingLine: line}
@@ -158,7 +193,7 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 				match.After = append([]string(nil), lines[i+1:after]...)
 			}
 			if searchResultSize(result.Matches)+searchMatchSize(match) > limits.MaxSearchResultBytes {
-				result.Truncated = true
+				truncate("result size limit reached; narrow the query or reduce context_lines")
 				return nil
 			}
 			result.Matches = append(result.Matches, match)
@@ -181,7 +216,7 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 				return ctx.Err()
 			default:
 			}
-			if name == ".git" || ignoredDirectory(name) {
+			if name == ".git" {
 				continue
 			}
 			var st unix.Stat_t
@@ -194,6 +229,9 @@ func (r *Root) SearchWithOptions(ctx context.Context, query string, options Sear
 			rel := joinRel(prefix, name)
 			switch st.Mode & unix.S_IFMT {
 			case unix.S_IFDIR:
+				if skipDir(rel, name) {
+					continue
+				}
 				child, err := openAt(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 				if err != nil {
 					return errors.New("directory changed or became unsafe during search")

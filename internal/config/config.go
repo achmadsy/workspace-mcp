@@ -2,6 +2,7 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -53,6 +54,20 @@ type Config struct {
 	ExecCPUSeconds   uint64
 	ExecMaxProcesses uint64
 	ExecMaxOpenFiles uint64
+	// ExecMaxFileBytes bounds the size of any single file a sandboxed command may
+	// create (RLIMIT_FSIZE). It is independent of ExecMaxOutput.
+	ExecMaxFileBytes uint64
+	// ExecDisableUserns prevents sandboxed code from creating nested user
+	// namespaces. It is requested via MCP_EXEC_DISABLE_USERNS and downgraded at
+	// startup when the installed bubblewrap does not support it.
+	ExecDisableUserns bool
+	// SlirpSandbox and SlirpSeccomp harden the slirp4netns helper. They are
+	// requested via MCP_SLIRP_HARDENING and downgraded when unsupported.
+	SlirpSandbox bool
+	SlirpSeccomp bool
+	// SystemctlPath is optional; when present it is used as a best-effort
+	// fallback to kill a sandbox scope after timeout or cancellation.
+	SystemctlPath string
 
 	GitCredentialMode string
 	GitCredentialFile string
@@ -77,10 +92,17 @@ func Load() (Config, error) {
 	c.ExecJobTTL = envDuration("MCP_EXEC_JOB_TTL", limits.ExecJobTTL)
 	c.ExecMaxOutput = envInt("MCP_EXEC_MAX_OUTPUT", limits.MaxExecOutput)
 	c.ExecMaxJobs = envInt("MCP_EXEC_MAX_JOBS", limits.MaxExecJobs)
-	c.ExecMemoryBytes = uint64(envInt64("MCP_EXEC_MEMORY_BYTES", 1<<30))
+	c.ExecMemoryBytes = uint64(envInt64("MCP_EXEC_MEMORY_BYTES", 2<<30))
 	c.ExecCPUSeconds = uint64(envInt64("MCP_EXEC_CPU_SECONDS", 300))
-	c.ExecMaxProcesses = uint64(envInt64("MCP_EXEC_MAX_PROCESSES", 128))
+	// RLIMIT_NPROC is per real UID and would also count the server itself, so the
+	// process bound is enforced per sandbox through the cgroup TasksMax instead.
+	// TasksMax counts threads, so the default leaves room for parallel builds.
+	c.ExecMaxProcesses = uint64(envInt64("MCP_EXEC_MAX_PROCESSES", 512))
 	c.ExecMaxOpenFiles = uint64(envInt64("MCP_EXEC_MAX_OPEN_FILES", 1024))
+	c.ExecMaxFileBytes = uint64(envInt64("MCP_EXEC_MAX_FILE_BYTES", 1<<30))
+	c.ExecDisableUserns = envBoolDefault("MCP_EXEC_DISABLE_USERNS", true)
+	hardenSlirp := envBoolDefault("MCP_SLIRP_HARDENING", true)
+	c.SlirpSandbox, c.SlirpSeccomp = hardenSlirp, hardenSlirp
 	c.GitCredentialMode = envDefault("MCP_GIT_CREDENTIAL_MODE", "none")
 	c.GitCredentialFile = strings.TrimSpace(os.Getenv("MCP_GIT_CREDENTIAL_FILE"))
 	c.GitKnownHostsFile = strings.TrimSpace(os.Getenv("MCP_GIT_KNOWN_HOSTS_FILE"))
@@ -167,6 +189,28 @@ func envDefault(k, d string) string {
 	return d
 }
 func envBool(k string) bool { v, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(k))); return v }
+
+// envBoolDefault returns d when the variable is unset or not a valid boolean.
+func envBoolDefault(k string, d bool) bool {
+	raw := strings.TrimSpace(os.Getenv(k))
+	if raw == "" {
+		return d
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return d
+	}
+	return v
+}
+
+// helpMentions reports whether `binary --help` documents flag. It is used to
+// enable optional hardening only on helper versions that support it.
+func helpMentions(binary, flag string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+	return strings.Contains(string(out), flag)
+}
 func envInt(k string, d int) int {
 	v, err := strconv.Atoi(envDefault(k, strconv.Itoa(d)))
 	if err != nil {
@@ -204,6 +248,14 @@ func (c *Config) validateAgentic() error {
 	if c.ExecMaxOutput < 4096 || c.ExecMaxOutput > 8<<20 || c.ExecMaxJobs < 1 || c.ExecMaxJobs > 64 || c.ExecMemoryBytes < 64<<20 || c.ExecCPUSeconds < 1 || c.ExecMaxProcesses < 8 || c.ExecMaxOpenFiles < 64 {
 		return errors.New("execution resource limits are outside allowed ranges")
 	}
+	// Invalid numeric input parses to -1, which wraps to a huge unsigned value;
+	// the upper bounds reject that as well as unreasonable settings.
+	if c.ExecMemoryBytes > 1<<40 || c.ExecCPUSeconds > 1<<20 || c.ExecMaxProcesses > 1<<20 || c.ExecMaxOpenFiles > 1<<22 {
+		return errors.New("execution resource limits are outside allowed ranges")
+	}
+	if c.ExecMaxFileBytes < 1<<20 || c.ExecMaxFileBytes > 1<<40 {
+		return errors.New("MCP_EXEC_MAX_FILE_BYTES must be between 1 MiB and 1 TiB")
+	}
 	if !c.EnableExec && !c.EnableGitWrite {
 		return nil
 	}
@@ -221,6 +273,16 @@ func (c *Config) validateAgentic() error {
 	}
 	if c.PrlimitPath, err = exec.LookPath("prlimit"); err != nil {
 		return errors.New("agentic features require prlimit for process resource limits")
+	}
+	c.SystemctlPath, _ = exec.LookPath("systemctl")
+	if c.ExecDisableUserns && !helpMentions(c.BwrapPath, "--disable-userns") {
+		c.ExecDisableUserns = false
+	}
+	if c.Slirp4netnsPath != "" {
+		c.SlirpSandbox = c.SlirpSandbox && helpMentions(c.Slirp4netnsPath, "--enable-sandbox")
+		c.SlirpSeccomp = c.SlirpSeccomp && helpMentions(c.Slirp4netnsPath, "--enable-seccomp")
+	} else {
+		c.SlirpSandbox, c.SlirpSeccomp = false, false
 	}
 	if c.EnableGitNetwork {
 		switch c.GitCredentialMode {

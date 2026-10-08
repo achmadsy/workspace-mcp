@@ -3,6 +3,7 @@
 package workspace
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -34,12 +35,33 @@ func TestStatReadRangeAndGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"src/nested/c.go"}; !reflect.DeepEqual(matches, want) {
+	if want := []string{"src/nested/c.go"}; !reflect.DeepEqual(matches.Paths, want) || matches.Truncated {
 		t.Fatalf("matches = %#v, want %#v", matches, want)
 	}
 	matches, err = r.Glob("*.go", "src")
-	if err != nil || !reflect.DeepEqual(matches, []string{"src/a.go"}) {
+	if err != nil || !reflect.DeepEqual(matches.Paths, []string{"src/a.go"}) || matches.Truncated {
 		t.Fatalf("flat matches = %#v, %v", matches, err)
+	}
+	none, err := r.Glob("*.rs", "src")
+	if err != nil || none.Paths == nil || len(none.Paths) != 0 || none.Truncated {
+		t.Fatalf("empty glob must give an empty, non-nil list: %#v, %v", none, err)
+	}
+}
+
+func TestGlobTruncatesInsteadOfFailing(t *testing.T) {
+	r, dir := testRoot(t)
+	for i := 0; i < 2001; i++ {
+		mustWrite(t, dir, fmt.Sprintf("many/f%04d.txt", i), "x")
+	}
+	res, err := r.Glob("*.txt", "many")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Truncated || res.TruncatedReason == "" || len(res.Paths) != 2000 {
+		t.Fatalf("glob = %d paths truncated=%t reason=%q", len(res.Paths), res.Truncated, res.TruncatedReason)
+	}
+	if res.Paths[0] != "many/f0000.txt" || res.Paths[1999] != "many/f1999.txt" {
+		t.Fatalf("partial result is not the sorted prefix: %q ... %q", res.Paths[0], res.Paths[1999])
 	}
 }
 

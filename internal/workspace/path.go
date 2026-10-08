@@ -45,7 +45,7 @@ func ValidatePath(p string, allowEmpty bool) error {
 
 func ignoredDirectory(name string) bool {
 	switch name {
-	case "node_modules", "vendor", ".venv", "target", "dist", "build":
+	case "node_modules", "vendor", ".venv", "target", "dist", "build", ".tools":
 		return true
 	}
 	return false

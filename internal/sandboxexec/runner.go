@@ -37,6 +37,17 @@ const (
 	secretFD    = 6
 )
 
+// selfTestScript runs inside the sandbox at startup. It checks isolation
+// properties rather than only proving that a process can start. Each failing
+// check has its own exit code so the startup error is actionable.
+const selfTestScript = `test -d /workspace && test -w /workspace || exit 11
+test ! -e /root || exit 12
+test ! -e /etc/shadow || exit 13
+test -z "$(ls -A /home)" || exit 14
+test ! -e /run/user || exit 15
+test -s /etc/passwd || exit 16
+`
+
 // GitCredentialFiles are pre-opened, revalidated credential descriptors for one
 // dedicated Git network command. General Run and RunIsolated never accept them.
 type GitCredentialFiles struct {
@@ -81,7 +92,7 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 	r := &Runner{cfg: cfg, root: root, sem: make(chan struct{}, limits.MaxExecConcurrency)}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	testRequest := Request{Argv: []string{"/bin/true"}, TimeoutMS: 4000}
+	testRequest := Request{Script: selfTestScript, TimeoutMS: 4000}
 	var res Result
 	var err error
 	if cfg.EnableExec || cfg.EnableGitNetwork {
@@ -93,7 +104,7 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 		return nil, fmt.Errorf("sandbox self-test failed: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return nil, fmt.Errorf("sandbox self-test failed with exit code %d", res.ExitCode)
+		return nil, fmt.Errorf("sandbox self-test failed with exit code %d (11 workspace, 12 /root visible, 13 /etc/shadow visible, 14 /home not empty, 15 /run/user visible, 16 /etc/passwd missing): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return r, nil
 }
@@ -115,20 +126,24 @@ func (r *Runner) RunGitNetwork(ctx context.Context, request Request, extraEnv ma
 	if !r.cfg.EnableGitNetwork {
 		return Result{}, errors.New("Git network execution is disabled")
 	}
-	if (credentials.HTTPSToken != nil) == (credentials.SSHKey != nil || credentials.KnownHosts != nil) && credentials.HTTPSToken != nil {
+	hasSSH := credentials.SSHKey != nil || credentials.KnownHosts != nil
+	hasHTTPS := credentials.HTTPSToken != nil
+	if hasSSH && hasHTTPS {
 		return Result{}, errors.New("provide exactly one Git credential mode")
 	}
 	if (credentials.SSHKey == nil) != (credentials.KnownHosts == nil) {
 		return Result{}, errors.New("SSH key and known_hosts must be provided together")
 	}
-	out := &limitBuffer{limit: r.cfg.ExecMaxOutput}
-	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	out := &limitBuffer{limit: r.cfg.ExecMaxOutput, mode: bufferHeadTail}
+	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput, mode: bufferHeadTail}
 	return r.runWithBuffersAndCredentials(ctx, request, extraEnv, true, out, errOut, nil, credentials)
 }
 
 func (r *Runner) run(ctx context.Context, request Request, extraEnv map[string]string, network bool) (Result, error) {
-	out := &limitBuffer{limit: r.cfg.ExecMaxOutput}
-	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput}
+	// Synchronous runs keep the head and the tail of each stream: build and test
+	// failures are normally reported at the end of the output.
+	out := &limitBuffer{limit: r.cfg.ExecMaxOutput, mode: bufferHeadTail}
+	errOut := &limitBuffer{limit: r.cfg.ExecMaxOutput, mode: bufferHeadTail}
 	return r.runWithBuffers(ctx, request, extraEnv, network, out, errOut, nil)
 }
 
@@ -186,7 +201,7 @@ func (r *Runner) runWithBuffersAndCredentials(ctx context.Context, request Reque
 	for _, file := range generatedFiles {
 		defer file.Close()
 	}
-	cmd := r.systemdCommand(runCtx, args, rootFile, statusWriter, blockReader, secretFiles, out, errOut)
+	cmd, unit := r.systemdCommand(runCtx, args, rootFile, statusWriter, blockReader, secretFiles, out, errOut)
 	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		return Result{}, errors.New("sandbox command could not be started")
@@ -212,32 +227,76 @@ func (r *Runner) runWithBuffersAndCredentials(ctx context.Context, request Reque
 		runErr, err = r.runNetworkHandshake(runCtx, cmd, commandDone, statusReader, blockWriter, errOut)
 		if err != nil {
 			cancelProcessGroup(cmd)
+			r.killUnit(unit)
 			<-commandDone
 			return Result{}, err
 		}
 	} else {
 		runErr = <-commandDone
 	}
+	if runCtx.Err() != nil {
+		// Timeout or cancellation: make sure nothing survives in the scope.
+		r.killUnit(unit)
+	}
 	return commandResult(runCtx, cmd, runErr, startedAt, out, errOut), nil
 }
 
-func (r *Runner) systemdCommand(ctx context.Context, sandboxArgs []string, rootFile, statusWriter, blockReader *os.File, secretFiles []*os.File, out, errOut io.Writer) *exec.Cmd {
+// killUnit is a best-effort backstop that kills every process in a sandbox
+// scope. Process-group and PID-namespace teardown normally suffice; this covers
+// helpers that escape the process group. Errors are ignored because the scope
+// usually no longer exists.
+func (r *Runner) killUnit(unit string) {
+	if r.cfg.SystemctlPath == "" || unit == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, r.cfg.SystemctlPath, "--user", "kill", "--signal=SIGKILL", unit+".scope")
+	cmd.Env = systemdClientEnv()
+	_ = cmd.Run()
+}
+
+// systemdClientEnv is the environment for systemd client tools. It stays minimal
+// but must carry the location of the user manager's bus, which holds no secret.
+func systemdClientEnv() []string {
+	env := buildEnvironment(nil, nil)
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		candidate := "/run/user/" + strconv.Itoa(os.Getuid())
+		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
+			runtimeDir = candidate
+		}
+	}
+	if runtimeDir != "" {
+		env = append(env, "XDG_RUNTIME_DIR="+runtimeDir)
+	}
+	if bus := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); bus != "" {
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS="+bus)
+	}
+	return env
+}
+
+func (r *Runner) systemdCommand(ctx context.Context, sandboxArgs []string, rootFile, statusWriter, blockReader *os.File, secretFiles []*os.File, out, errOut io.Writer) (*exec.Cmd, string) {
 	unit := randomUnit()
 	systemdArgs := []string{
 		"--user", "--scope", "--quiet", "--collect",
 		"--unit=" + unit,
 		"--property=MemoryMax=" + strconv.FormatUint(r.cfg.ExecMemoryBytes, 10),
+		"--property=MemorySwapMax=0",
 		"--property=TasksMax=" + strconv.FormatUint(r.cfg.ExecMaxProcesses, 10),
 		"--property=CPUQuota=100%",
 		"--",
 		r.cfg.PrlimitPath,
 		"--cpu=" + strconv.FormatUint(r.cfg.ExecCPUSeconds, 10),
-		"--as=" + strconv.FormatUint(r.cfg.ExecMemoryBytes, 10),
-		"--fsize=" + strconv.Itoa(r.cfg.ExecMaxOutput*2),
-		"--nproc=" + strconv.FormatUint(r.cfg.ExecMaxProcesses, 10),
 		"--nofile=" + strconv.FormatUint(r.cfg.ExecMaxOpenFiles, 10),
-		"--",
 	}
+	// Deliberately no --as (virtual address space; Go, Node and the JVM reserve far
+	// more than they use) and no --nproc (counted per real UID, including the
+	// server itself). Memory and task limits are enforced by the cgroup scope.
+	if r.cfg.ExecMaxFileBytes > 0 {
+		systemdArgs = append(systemdArgs, "--fsize="+strconv.FormatUint(r.cfg.ExecMaxFileBytes, 10))
+	}
+	systemdArgs = append(systemdArgs, "--")
 	systemdArgs = append(systemdArgs, sandboxArgs...)
 	cmd := exec.CommandContext(ctx, r.cfg.SystemdRunPath, systemdArgs...)
 	cmd.ExtraFiles = []*os.File{rootFile}
@@ -245,15 +304,16 @@ func (r *Runner) systemdCommand(ctx context.Context, sandboxArgs []string, rootF
 		cmd.ExtraFiles = append(cmd.ExtraFiles, statusWriter, blockReader)
 	}
 	cmd.ExtraFiles = append(cmd.ExtraFiles, secretFiles...)
-	cmd.Env = buildEnvironment(nil, nil)
+	cmd.Env = systemdClientEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		cancelProcessGroup(cmd)
+		go r.killUnit(unit)
 		return nil
 	}
 	cmd.WaitDelay = time.Second
 	cmd.Stdout, cmd.Stderr = out, errOut
-	return cmd
+	return cmd, unit
 }
 
 func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, commandDone <-chan error, statusReader, blockWriter *os.File, errOut *limitBuffer) (error, error) {
@@ -324,17 +384,23 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 	}
 	args := []string{
 		r.cfg.BwrapPath,
-		"--die-with-parent", "--new-session", "--unshare-all",
+		"--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+	}
+	if r.cfg.ExecDisableUserns {
+		// Forbid nested user namespaces inside the sandbox (reduces kernel attack
+		// surface). Enabled only when the installed bubblewrap supports it.
+		args = append(args, "--unshare-user", "--disable-userns")
+	}
+	args = append(args,
 		"--ro-bind", "/usr", "/usr",
 		"--ro-bind-try", "/bin", "/bin",
 		"--ro-bind-try", "/lib", "/lib",
 		"--ro-bind-try", "/lib64", "/lib64",
 		"--dir", "/etc",
-		"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
 		"--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
 		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
-		"--bind", "/proc/self/fd/" + strconv.Itoa(workspaceFD), "/workspace", "--chdir", cwd,
-	}
+		"--bind", "/proc/self/fd/"+strconv.Itoa(workspaceFD), "/workspace", "--chdir", cwd,
+	)
 	if network {
 		if r.cfg.Slirp4netnsPath == "" {
 			return nil, nil, nil, errors.New("isolated network helper is unavailable")
@@ -344,9 +410,15 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 			"--block-fd", strconv.Itoa(blockFD),
 		)
 	}
-	secretFiles := make([]*os.File, 0, 2)
-	generatedFiles := make([]*os.File, 0, 1)
-	nextFD := secretFD
+	secretFiles := make([]*os.File, 0, 8)
+	generatedFiles := make([]*os.File, 0, 6)
+	// Descriptors after the workspace root (and, with networking, the status and
+	// block pipes) are the files appended to secretFiles, in order.
+	fdBase := workspaceFD + 1
+	if network {
+		fdBase = secretFD
+	}
+	nextFD := fdBase
 	switch {
 	case credentials.SSHKey != nil:
 		keySource := "/proc/self/fd/" + strconv.Itoa(nextFD)
@@ -381,6 +453,14 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 		extraEnv["GIT_ASKPASS"] = "/run/workspace-mcp/askpass"
 		extraEnv["MCP_ASKPASS_TOKEN_FILE"] = "/run/workspace-mcp/token"
 	}
+	etcArgs, etcFiles, err := syntheticEtc(network, fdBase+len(secretFiles))
+	if err != nil {
+		closeAll(generatedFiles)
+		return nil, nil, nil, errors.New("create sandbox /etc files")
+	}
+	args = append(args, etcArgs...)
+	secretFiles = append(secretFiles, etcFiles...)
+	generatedFiles = append(generatedFiles, etcFiles...)
 	args = append(args, "--", "/usr/bin/env", "-i")
 	args = append(args, buildEnvironment(request.Env, extraEnv)...)
 	if request.Script != "" {
@@ -390,6 +470,15 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 }
 
 func anonymousFile(name string, content []byte) (*os.File, error) {
+	return memFile(name, content, 0o500)
+}
+
+// anonymousDataFile creates a read-only data file for non-executable content.
+func anonymousDataFile(name string, content []byte) (*os.File, error) {
+	return memFile(name, content, 0o444)
+}
+
+func memFile(name string, content []byte, mode uint32) (*os.File, error) {
 	fd, err := unix.MemfdCreate(name, unix.MFD_CLOEXEC)
 	if err != nil {
 		return nil, err
@@ -403,11 +492,62 @@ func anonymousFile(name string, content []byte) (*os.File, error) {
 		file.Close()
 		return nil, err
 	}
-	if err := unix.Fchmod(fd, 0o500); err != nil {
+	if err := unix.Fchmod(fd, mode); err != nil {
 		file.Close()
 		return nil, err
 	}
 	return file, nil
+}
+
+type etcEntry struct {
+	path    string
+	content string
+}
+
+// syntheticEtc builds the minimal /etc files as anonymous in-memory files, so
+// the sandbox never sees host account data or host resolver configuration. The
+// host resolv.conf is deliberately not reused: it commonly points at a loopback
+// stub (127.0.0.53) that does not exist inside the private network namespace.
+// With networking, slirp4netns serves DNS at 10.0.2.3. passwd and group give
+// tools such as ssh an entry for the sandbox user. firstFD is the descriptor
+// number the first returned file will have in the child.
+func syntheticEtc(network bool, firstFD int) ([]string, []*os.File, error) {
+	uid, gid := os.Getuid(), os.Getgid()
+	passwd := "root:x:0:0:root:/root:/bin/sh\n"
+	if uid != 0 {
+		passwd += fmt.Sprintf("sandbox:x:%d:%d:sandbox:/home:/bin/sh\n", uid, gid)
+	}
+	group := "root:x:0:\n"
+	if gid != 0 {
+		group += fmt.Sprintf("sandbox:x:%d:\n", gid)
+	}
+	entries := []etcEntry{
+		{path: "/etc/passwd", content: passwd},
+		{path: "/etc/group", content: group},
+		{path: "/etc/hosts", content: "127.0.0.1 localhost\n::1 localhost\n"},
+		{path: "/etc/nsswitch.conf", content: "passwd: files\ngroup: files\nhosts: files dns\n"},
+	}
+	if network {
+		entries = append(entries, etcEntry{path: "/etc/resolv.conf", content: "nameserver 10.0.2.3\n"})
+	}
+	args := make([]string, 0, len(entries)*3)
+	files := make([]*os.File, 0, len(entries))
+	for i, entry := range entries {
+		file, err := anonymousDataFile("etc", []byte(entry.content))
+		if err != nil {
+			closeAll(files)
+			return nil, nil, err
+		}
+		files = append(files, file)
+		args = append(args, "--ro-bind", "/proc/self/fd/"+strconv.Itoa(firstFD+i), entry.path)
+	}
+	return args, files, nil
+}
+
+func closeAll(files []*os.File) {
+	for _, file := range files {
+		_ = file.Close()
+	}
 }
 
 func cloneEnvironment(source map[string]string) map[string]string {
@@ -464,10 +604,16 @@ func (r *Runner) startNetwork(ctx context.Context, childPID int, errOut io.Write
 		readyWriter.Close()
 		return nil, errors.New("network lifetime pipe is unavailable")
 	}
-	args := []string{
-		"--configure", "--mtu=65520", "--disable-host-loopback",
-		"--ready-fd=3", "--exit-fd=4", strconv.Itoa(childPID), "tap0",
+	args := []string{"--configure", "--mtu=65520", "--disable-host-loopback"}
+	// The helper runs on the host and parses guest traffic, so confine it when the
+	// installed slirp4netns supports it (probed at startup).
+	if r.cfg.SlirpSandbox {
+		args = append(args, "--enable-sandbox")
 	}
+	if r.cfg.SlirpSeccomp {
+		args = append(args, "--enable-seccomp")
+	}
+	args = append(args, "--ready-fd=3", "--exit-fd=4", strconv.Itoa(childPID), "tap0")
 	cmd := exec.CommandContext(ctx, r.cfg.Slirp4netnsPath, args...)
 	cmd.ExtraFiles = []*os.File{readyWriter, exitReader}
 	cmd.Env = buildEnvironment(nil, nil)
@@ -618,10 +764,28 @@ func randomUnit() string {
 	return "workspace-mcp-" + hex.EncodeToString(b[:])
 }
 
+// bufferMode selects how a limitBuffer retains output beyond its limit.
+type bufferMode int
+
+const (
+	// bufferHead keeps the first limit bytes. Cursors are offsets into them.
+	bufferHead bufferMode = iota
+	// bufferHeadTail keeps a quarter of the limit from the start and the rest
+	// from the end, with an omission marker between them. Build and test failures
+	// are usually reported at the end of the output.
+	bufferHeadTail
+	// bufferRolling keeps the most recent limit bytes. Cursors are absolute
+	// stream offsets, so a poller sees how much was dropped between polls.
+	bufferRolling
+)
+
 type limitBuffer struct {
 	mu        sync.Mutex
-	b         bytes.Buffer
+	b         bytes.Buffer // retained head (bufferHead, bufferHeadTail) or window (bufferRolling)
+	tail      []byte       // bufferHeadTail only
 	limit     int
+	mode      bufferMode
+	dropped   int // bytes omitted from the stream (bufferHeadTail, bufferRolling)
 	truncated bool
 }
 
@@ -629,12 +793,38 @@ func (b *limitBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	n := len(p)
-	remaining := b.limit - b.b.Len()
-	if remaining > 0 {
-		_, _ = b.b.Write(p[:min(len(p), remaining)])
-	}
-	if n > remaining {
-		b.truncated = true
+	switch b.mode {
+	case bufferHeadTail:
+		headLimit := b.limit / 4
+		if room := headLimit - b.b.Len(); room > 0 {
+			take := min(room, len(p))
+			_, _ = b.b.Write(p[:take])
+			p = p[take:]
+		}
+		if len(p) > 0 {
+			tailLimit := b.limit - headLimit
+			b.tail = append(b.tail, p...)
+			if over := len(b.tail) - tailLimit; over > 0 {
+				b.tail = b.tail[over:]
+				b.dropped += over
+				b.truncated = true
+			}
+		}
+	case bufferRolling:
+		_, _ = b.b.Write(p)
+		if over := b.b.Len() - b.limit; over > 0 {
+			b.b.Next(over)
+			b.dropped += over
+			b.truncated = true
+		}
+	default:
+		remaining := b.limit - b.b.Len()
+		if remaining > 0 {
+			_, _ = b.b.Write(p[:min(len(p), remaining)])
+		}
+		if n > remaining {
+			b.truncated = true
+		}
 	}
 	return n, nil
 }
@@ -642,17 +832,40 @@ func (b *limitBuffer) Write(p []byte) (int, error) {
 func (b *limitBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.mode == bufferHeadTail {
+		if b.dropped == 0 {
+			return b.b.String() + string(b.tail)
+		}
+		return fmt.Sprintf("%s\n[... %d bytes omitted ...]\n%s", b.b.String(), b.dropped, b.tail)
+	}
 	return b.b.String()
 }
 
+// Slice returns retained output from cursor offset, the next cursor, and the
+// truncation flag. In bufferRolling mode the cursor is an absolute stream
+// offset; an offset older than the retained window resumes at its start.
 func (b *limitBuffer) Slice(offset int) (string, int, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	data := b.b.Bytes()
+	if b.mode == bufferRolling {
+		total := b.dropped + len(data)
+		if offset < 0 || offset > total {
+			return "", total, b.truncated, errors.New("output cursor is outside retained data")
+		}
+		return string(data[max(0, offset-b.dropped):]), total, b.truncated, nil
+	}
 	if offset < 0 || offset > len(data) {
 		return "", len(data), b.truncated, errors.New("output cursor is outside retained data")
 	}
 	return string(data[offset:]), len(data), b.truncated, nil
+}
+
+// Dropped reports how many bytes were omitted from the retained output.
+func (b *limitBuffer) Dropped() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropped
 }
 
 func (b *limitBuffer) Truncated() bool {

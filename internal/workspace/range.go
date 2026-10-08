@@ -95,40 +95,50 @@ func (r *Root) ReadRange(p string, offset, length int64) (RangeResult, error) {
 	}, nil
 }
 
+// GlobResult is the structured result of Glob. Paths is never nil. When
+// Truncated is true the list is incomplete and TruncatedReason says why, so a
+// short or empty list is not mistaken for "no match".
+type GlobResult struct {
+	Paths           []string `json:"paths"`
+	Truncated       bool     `json:"truncated"`
+	TruncatedReason string   `json:"truncated_reason,omitempty"`
+}
+
 // Glob matches one slash-separated pattern below an optional root path.
 // Components may use *, ?, and [...] character classes. Matches are
-// deterministic and bounded; symlinks and .git are never traversed.
-func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
+// deterministic and bounded; symlinks and .git are never traversed. Hitting a
+// limit returns the matches found so far with Truncated set.
+func (r *Root) Glob(pattern, rootPath string) (GlobResult, error) {
 	if pattern == "" {
-		return nil, errors.New("pattern must not be empty")
+		return GlobResult{}, errors.New("pattern must not be empty")
 	}
 	if err := ValidatePath(rootPath, true); err != nil {
-		return nil, err
+		return GlobResult{}, err
 	}
 	parts := strings.Split(pattern, "/")
 	if len(parts) > limits.MaxParentDepth {
-		return nil, ErrUnsafePath
+		return GlobResult{}, ErrUnsafePath
 	}
 	for _, part := range parts {
 		if part == "" || part == "." || part == ".." || strings.Contains(part, "\\") || len(part) > limits.MaxPathComponent {
-			return nil, ErrUnsafePath
+			return GlobResult{}, ErrUnsafePath
 		}
 		if part == ".git" {
-			return nil, errors.New(".git is reserved")
+			return GlobResult{}, errors.New(".git is reserved")
 		}
 		if _, err := path.Match(part, ""); err != nil {
-			return nil, errors.New("invalid glob pattern")
+			return GlobResult{}, errors.New("invalid glob pattern")
 		}
 	}
 	start, err := r.rootFD()
 	if err != nil {
-		return nil, err
+		return GlobResult{}, err
 	}
 	if rootPath != "" {
 		unix.Close(start)
 		start, err = r.open(rootPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if err != nil {
-			return nil, errors.New("glob root is unavailable or unsafe")
+			return GlobResult{}, errors.New("glob root is unavailable or unsafe")
 		}
 	}
 	type target struct {
@@ -145,8 +155,15 @@ func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
 	}
 	current := []target{{fd: start, rel: rootPath, owned: true}}
 	defer func() { closeTargets(current) }()
-	var matches []string
+	result := GlobResult{Paths: make([]string, 0)}
+	truncate := func(reason string) {
+		result.Truncated = true
+		if result.TruncatedReason == "" {
+			result.TruncatedReason = reason
+		}
+	}
 	scanned := 0
+outer:
 	for i, part := range parts {
 		last := i == len(parts)-1
 		var next []target
@@ -161,7 +178,8 @@ func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
 				for _, name := range names {
 					ok, err := path.Match(part, name)
 					if err != nil {
-						return nil, ErrUnsafePath
+						closeTargets(next)
+						return GlobResult{}, ErrUnsafePath
 					}
 					if ok {
 						candidates = append(candidates, name)
@@ -171,7 +189,9 @@ func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
 			for _, name := range candidates {
 				scanned++
 				if scanned > limits.MaxGlobScanEntries {
-					return nil, errors.New("glob scan exceeds entry limit")
+					truncate("scan entry limit reached; use a more specific pattern or a deeper `path`")
+					closeTargets(next)
+					break outer
 				}
 				if name == ".git" {
 					continue
@@ -182,10 +202,12 @@ func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
 				}
 				rel := joinRel(t.rel, name)
 				if last {
-					if len(matches) >= limits.MaxGlobResults {
-						return nil, errors.New("glob matches exceed limit")
+					if len(result.Paths) >= limits.MaxGlobResults {
+						truncate("result limit reached; use a more specific pattern")
+						closeTargets(next)
+						break outer
 					}
-					matches = append(matches, rel)
+					result.Paths = append(result.Paths, rel)
 					continue
 				}
 				if st.Mode&unix.S_IFMT != unix.S_IFDIR || ignoredDirectory(name) {
@@ -200,12 +222,13 @@ func (r *Root) Glob(pattern, rootPath string) ([]string, error) {
 		}
 		closeTargets(current)
 		current = next
-		if len(matches)+len(current) > limits.MaxGlobResults {
-			return nil, errors.New("glob matches exceed limit")
+		if len(result.Paths)+len(current) > limits.MaxGlobResults {
+			truncate("too many intermediate directories; use a more specific pattern")
+			break outer
 		}
 	}
-	sort.Strings(matches)
-	return matches, nil
+	sort.Strings(result.Paths)
+	return result, nil
 }
 
 func joinRel(prefix, name string) string {

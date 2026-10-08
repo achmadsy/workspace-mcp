@@ -72,6 +72,11 @@ errors rather than transport failures.
 - **State**: OAuth state is AES-256-GCM encrypted in `MCP_STATE_DIR` (0600
   file, 0700 dir, exclusive flock). Secrets, tokens, passwords, file contents,
   and search queries never appear in logs.
+- **Audit**: exec, Git write/network, and every mutating workspace tool
+  (`workspace_write`, `workspace_edit`, `workspace_mkdir`, `workspace_delete`,
+  `workspace_move`, `workspace_copy`, `workspace_apply_patch`) log one entry per
+  call with the client ID, tool, request ID, paths, byte counts, and an error
+  flag. Content, edit text, and patch text are never logged.
 - **Safe profile reach**: only `WORKSPACE_ROOT`. Nothing else — not `/etc`,
   not `~/.ssh`, not other repositories, not host environment, no host shell.
 - **Agentic execution**: every command runs through `systemd-run --user --scope`,
@@ -90,6 +95,34 @@ errors rather than transport failures.
 > inside the workspace can read and exfiltrate all workspace content through
 > outbound network. Enable it only for an owner-controlled connector and only
 > for workspaces whose contents may be exposed to that connector.
+
+### Sandbox network reach
+
+When `MCP_ENABLE_EXEC` is on, sandboxed commands get a private network
+namespace attached through `slirp4netns`, with DNS served by slirp at
+`10.0.2.3`. `--disable-host-loopback` blocks only the **host's own loopback**
+(`127.0.0.0/8` on the machine running the server), so services bound to
+`127.0.0.1` here, such as the MCP server itself or a local database, are not
+reachable from the sandbox.
+
+It is **not** an egress filter. Sandboxed code can still open outbound
+connections to anything the host can route to, including:
+
+- other machines on your LAN and any RFC 1918 range (`10/8`, `172.16/12`,
+  `192.168/16`), such as routers, NAS devices, and internal dashboards;
+- link-local addresses, notably the cloud metadata endpoint
+  `169.254.169.254` when the server runs on a cloud VM;
+- the public internet.
+
+Treat the sandbox as having the same network position as the host's user for
+outbound traffic. If that matters for your environment, enforce limits outside
+the server: run it on a host or VLAN with restricted egress, or add
+host-firewall rules for the server user (for example `nftables` rules matching
+the user's UID or the `slirp4netns` helper), and block `169.254.169.254` on
+cloud VMs. A built-in egress policy is not implemented yet.
+
+`server_capabilities` reports `exec_network: true` whenever exec is enabled so
+a client can tell.
 
 ## Requirements
 

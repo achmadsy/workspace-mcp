@@ -3,6 +3,8 @@
 package sandboxexec
 
 import (
+	"context"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -88,7 +90,7 @@ func TestCommandArgsCredentialMounts(t *testing.T) {
 			t.Errorf("SSH args missing %q: %q", want, joined)
 		}
 	}
-	if len(files) != 2 {
+	if len(files) != 2+syntheticEtcFiles(true) {
 		t.Fatalf("SSH files = %d", len(files))
 	}
 
@@ -114,7 +116,7 @@ func TestCommandArgsCredentialMounts(t *testing.T) {
 			t.Errorf("HTTPS args missing %q: %q", want, joined)
 		}
 	}
-	if len(files) != 2 || len(generated) != 1 {
+	if len(files) != 2+syntheticEtcFiles(true) || len(generated) != 1+syntheticEtcFiles(true) {
 		t.Fatalf("HTTPS files = %d generated = %d", len(files), len(generated))
 	}
 }
@@ -211,5 +213,166 @@ func testConfig() config.Config {
 		ExecTimeout: time.Second, ExecJobTimeout: time.Minute, ExecJobTTL: time.Minute,
 		ExecMaxOutput: 1024, ExecMaxJobs: 4, ExecMemoryBytes: 1 << 30,
 		ExecCPUSeconds: 60, ExecMaxProcesses: 32, ExecMaxOpenFiles: 128,
+		ExecMaxFileBytes: 1 << 30,
+	}
+}
+
+// syntheticEtcFiles is the number of in-memory /etc files mounted into a sandbox.
+func syntheticEtcFiles(network bool) int {
+	if network {
+		return 5
+	}
+	return 4
+}
+
+func TestCommandArgsHardening(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.ExecDisableUserns = true
+	runner := &Runner{cfg: cfg}
+
+	args, files, generated, err := runner.commandArgs(Request{Argv: []string{"/usr/bin/true"}}, nil, true, GitCredentialFiles{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFiles(generated)
+	joined := strings.Join(args, "\x00")
+	for _, want := range []string{
+		"--unshare-all", "--cap-drop\x00ALL", "--unshare-user\x00--disable-userns",
+		"--die-with-parent", "--new-session",
+		"--ro-bind\x00/proc/self/fd/6\x00/etc/passwd",
+		"--ro-bind\x00/proc/self/fd/7\x00/etc/group",
+		"--ro-bind\x00/proc/self/fd/10\x00/etc/resolv.conf",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("hardened args missing %q: %q", want, joined)
+		}
+	}
+	for _, unwanted := range []string{
+		"--ro-bind-try\x00/etc/resolv.conf", // host resolver config must never be reused
+		"--share-net", "/run/workspace-mcp", "GIT_ASKPASS", "GIT_SSH_COMMAND", "MCP_ASKPASS_TOKEN_FILE",
+	} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("general execution args must not contain %q: %q", unwanted, joined)
+		}
+	}
+	if len(files) != syntheticEtcFiles(true) {
+		t.Fatalf("files = %d", len(files))
+	}
+
+	// Without networking the status/block pipes are absent, so /etc files start at fd 4
+	// and there is no resolver file.
+	args, files, generated, err = runner.commandArgs(Request{Argv: []string{"/usr/bin/true"}}, nil, false, GitCredentialFiles{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFiles(generated)
+	joined = strings.Join(args, "\x00")
+	if !strings.Contains(joined, "--ro-bind\x00/proc/self/fd/4\x00/etc/passwd") {
+		t.Errorf("isolated args do not start /etc files at fd 4: %q", joined)
+	}
+	for _, unwanted := range []string{"/etc/resolv.conf", "--json-status-fd", "--block-fd"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("isolated args must not contain %q: %q", unwanted, joined)
+		}
+	}
+	if len(files) != syntheticEtcFiles(false) {
+		t.Fatalf("isolated files = %d", len(files))
+	}
+
+	// Nested user namespaces are only disabled when requested (and supported).
+	runner.cfg.ExecDisableUserns = false
+	args, _, generated, err = runner.commandArgs(Request{Argv: []string{"/usr/bin/true"}}, nil, false, GitCredentialFiles{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFiles(generated)
+	if joined = strings.Join(args, "\x00"); strings.Contains(joined, "--disable-userns") {
+		t.Errorf("--disable-userns present although disabled: %q", joined)
+	}
+}
+
+func TestSystemdCommandLimits(t *testing.T) {
+	t.Parallel()
+
+	runner := &Runner{cfg: testConfig()}
+	cmd, unit := runner.systemdCommand(context.Background(), []string{"/usr/bin/bwrap"}, os.Stdin, nil, nil, nil, io.Discard, io.Discard)
+	if !strings.HasPrefix(unit, "workspace-mcp-") {
+		t.Fatalf("unit = %q", unit)
+	}
+	joined := strings.Join(cmd.Args, "\x00")
+	for _, want := range []string{
+		"--property=MemoryMax=1073741824", "--property=MemorySwapMax=0", "--property=TasksMax=32",
+		"--cpu=60", "--nofile=128", "--fsize=1073741824",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("systemd args missing %q: %q", want, joined)
+		}
+	}
+	// The file-size limit must not be derived from the output limit (1024 here),
+	// and address-space / per-UID process limits must not be applied.
+	for _, unwanted := range []string{"--as=", "--nproc=", "--fsize=2048"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("systemd args must not contain %q: %q", unwanted, joined)
+		}
+	}
+}
+
+func TestLimitBufferHeadTail(t *testing.T) {
+	t.Parallel()
+
+	buffer := &limitBuffer{limit: 40, mode: bufferHeadTail}
+	if n, err := buffer.Write([]byte(strings.Repeat("a", 10))); err != nil || n != 10 {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if got := buffer.String(); got != strings.Repeat("a", 10) || buffer.Truncated() {
+		t.Fatalf("short output altered: %q truncated=%t", got, buffer.Truncated())
+	}
+	_, _ = buffer.Write([]byte(strings.Repeat("b", 100)))
+	_, _ = buffer.Write([]byte("END"))
+	got := buffer.String()
+	if !buffer.Truncated() || buffer.Dropped() == 0 {
+		t.Fatal("overflow must report truncation and dropped bytes")
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", 10)) {
+		t.Errorf("head not retained: %q", got)
+	}
+	if !strings.HasSuffix(got, "bbbEND") {
+		t.Errorf("tail not retained: %q", got)
+	}
+	if !strings.Contains(got, "bytes omitted") {
+		t.Errorf("missing omission marker: %q", got)
+	}
+	// Retained payload (excluding the marker) never exceeds the limit.
+	if retained := buffer.b.Len() + len(buffer.tail); retained > 40 {
+		t.Errorf("retained %d bytes, limit 40", retained)
+	}
+}
+
+func TestLimitBufferRollingCursors(t *testing.T) {
+	t.Parallel()
+
+	buffer := &limitBuffer{limit: 5, mode: bufferRolling}
+	_, _ = buffer.Write([]byte("abc"))
+	got, next, truncated, err := buffer.Slice(0)
+	if err != nil || got != "abc" || next != 3 || truncated {
+		t.Fatalf("Slice = %q, %d, %t, %v", got, next, truncated, err)
+	}
+	_, _ = buffer.Write([]byte("defgh")) // stream is now "abcdefgh"; window keeps "defgh"
+	got, next, truncated, err = buffer.Slice(next)
+	if err != nil || got != "defgh" || next != 8 || !truncated {
+		t.Fatalf("Slice after rollover = %q, %d, %t, %v", got, next, truncated, err)
+	}
+	if buffer.Dropped() != 3 {
+		t.Fatalf("Dropped = %d", buffer.Dropped())
+	}
+	// A cursor older than the window resumes at the start of the window.
+	got, _, _, err = buffer.Slice(0)
+	if err != nil || got != "defgh" {
+		t.Fatalf("stale cursor Slice = %q, %v", got, err)
+	}
+	if _, _, _, err := buffer.Slice(9); err == nil {
+		t.Fatal("cursor beyond the stream accepted")
 	}
 }
