@@ -233,10 +233,12 @@ tmux kill-session -t workspace-mcp-tunnel   # stop tunnel and server
 Add `--fg` to run in the calling terminal instead (Ctrl+C stops both
 processes). A custom session name can be set with `WORKSPACE_MCP_SESSION`.
 
-This one command bootstraps Go if needed, builds the server,
-generates or reuses secure OAuth credentials, starts `cloudflared`, prints the
-exact connector URL (`https://<random>.trycloudflare.com/mcp`) and the admin
-login password, then starts the server.
+This one command checks startup dependencies first and prints install guidance
+for anything missing, including `cloudflared` and all `--agentic` helpers. It
+then bootstraps Go if needed, builds the server, generates or reuses secure OAuth
+credentials, starts `cloudflared`, prints the exact connector URL
+(`https://<random>.trycloudflare.com/mcp`) and the admin login password, then
+starts the server.
 
 Credentials and encrypted OAuth state live under
 `${XDG_DATA_HOME:-$HOME/.local/share}/workspace-mcp`: the directory is mode

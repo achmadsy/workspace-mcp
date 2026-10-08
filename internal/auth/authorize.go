@@ -193,6 +193,7 @@ func pkceOK(verifier, challenge string) bool {
 	sum := sha256.Sum256([]byte(verifier))
 	return secureEqual(base64.RawURLEncoding.EncodeToString(sum[:]), challenge)
 }
+
 // grantedScope returns the scope string recorded for an authorization request.
 // Some OAuth clients (claude.ai among them) request only the base "workspace"
 // scope and never ask for the optional ones, so a bare "workspace" request is

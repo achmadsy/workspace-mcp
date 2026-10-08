@@ -275,6 +275,10 @@ func TestSecureCredentialFile(t *testing.T) {
 	if err := os.WriteFile(worldFile, []byte("sec"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile applies the umask; chmod makes the mode explicit.
+	if err := os.Chmod(worldFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := secureCredentialFile(worldFile, ws); err == nil {
 		t.Fatal("world-readable credential accepted")
 	}

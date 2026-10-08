@@ -91,6 +91,66 @@ Security notes:
 - [ ] Write/delete/patch share the base `workspace` scope with read; consider `workspace:write`.
 - [ ] Startup self-test does not exercise networking (DNS/connect through slirp).
 
+## 7. Re-review 2 (2026-10-08, after the build/test pass). Not implemented; needs approval.
+Section 6 steps 1 to 5 compile and pass tests at HEAD 4c5dfcc, so the "uncompiled" and "uncommitted"
+notes above are stale. Items marked (live) were observed while using this connector today.
+Bugs and risks, in priority order:
+- [x] A (live). Network start failures beyond one known signature. 3 of about 8 `exec_run` calls
+      failed with `isolated network helper closed its readiness pipe (stderr: setns(CLONE_NEWNET):
+      Operation not permitted | child failed(1))` and passed on an immediate retry. The retry
+      predicate only matches `setegid(0)` + `parent failed`, so `startNetworkWithRetry` never
+      engaged and the agent got a hard error. Fix: one shared allowlist predicate (both
+      signatures), used by the per-request retry and by `shouldRetryWithoutSlirpSandbox`; keep
+      the bound at 3 and only retry while the sandbox is still blocked; log attempt count and
+      helper stderr to find the real root cause (unconfirmed). Tests for both strings.
+      Done: `isTransientNetworkStartFailure` is an allowlist (`slirpMountSandboxFailure`,
+      `slirpNamespaceJoinFailure`), 5 attempts (50 to 200 ms backoff), attempt count in logs and in
+      the final error. Deviation: the startup downgrade (`shouldRetryWithoutSlirpSandbox`) stays
+      limited to the mount-sandbox signature, because a namespace join failure is not evidence
+      against that layer and must never weaken hardening. Needs a server restart to take effect.
+- [x] B. `evictOldestTerminalLocked` can delete a finished job whose output was never read, so
+      the agent sees "not found" for a job that succeeded. Fix: cap only running and queued jobs
+      at `ExecMaxJobs`, keep finished jobs in a separate bounded ring (e.g. 32) with the TTL, and
+      prefer evicting jobs already read to the end. Keep a tombstone (state, exit_code) so
+      `exec_status` can say "evicted".
+      Done in `jobs.go`: only queued and running jobs count against `ExecMaxJobs`; finished jobs
+      are trimmed to 32 (read ones first, then oldest unread); 256 bounded tombstones give
+      "job output is no longer available: <reason> (state, exit code)" to the owning client.
+- [ ] C. Scope expansion is all-or-nothing. A bare `workspace` request now grants exec, git write
+      and git network to any client the owner approves, and the consent page shows one long
+      string. Better: consent page with a checkbox per scope (`workspace` fixed on, others
+      default from config), token records exactly what was ticked (the token response already
+      returns `scope`). `st.Consents` is written but never read: use it or delete it.
+- [ ] D. Login rate limit is keyed by `RemoteAddr` (`clientIP`). Behind a local tunnel every
+      caller likely shares one bucket, so bad-password spam can lock the owner out (unconfirmed
+      for this deployment). Fix: trust `CF-Connecting-IP` only when the peer is loopback, add a
+      global cap, and confirm the attempts map is pruned.
+- [ ] E. No cap found by grep on `Pending` or `Clients` records created by unauthenticated
+      `/authorize` and `/register`, each persisted to the state file. Confirm in store.go and
+      registration.go, then add caps and TTL pruning.
+- [x] F. `gofmt -l` flags `internal/auth/authorize.go`. `startNetworkWithRetry` returns
+      `(*networkProcess, error, error)` (error not last): use a result struct. Add `gofmt -l`
+      and `go vet` to a check script. Done: `scripts/check.sh` (gofmt, vet, tests, umask 022).
+- [x] G. `TestSecureCredentialFile` and `TestCredentialBrokerRejectsUnsafeFiles` fail under umask
+      0077 (the sandbox default). `os.Chmod` after `WriteFile`.
+- [x] H. `.claude/` is untracked and holds `settings.local.json`; add it to `.gitignore`.
+Agent ergonomics (live evidence):
+- [ ] Persistent caches. `go: downloading golang.org/x/sys` ran on every call and a cold build took
+      about 25 s, because `/tmp` and `/home` are tmpfs. Add a server-owned cache dir mounted
+      read-write at `/cache` with `GOCACHE`, `GOMODCACHE`, npm and pip defaults. The cache is
+      writable by sandboxed code, so treat it as the same trust level as the workspace.
+- [ ] `exec_status` long poll: `wait_ms` (capped, returns on completion or new output). A 22 s
+      job took about 12 polls.
+- [ ] Discoverability. The sandbox default Go is 1.20.7 and cannot parse this project's go.mod;
+      the agent had to find `.tools/go` by trial. Add a configured PATH prefix, report it in
+      `server_capabilities`, and say the sync timeout limit in the "exceeds synchronous limit"
+      error (also expose it as a capability). Consider umask 022 for sandbox processes.
+- [ ] `workspace_apply_patch`: ignore header line numbers and locate hunks by context with a small
+      fuzz, plus create and delete. A hand-counted patch failed with "hunk context does not
+      match" today.
+Suggested order: A, B, then F, G, H (cheap), then persistent cache and `wait_ms` (largest
+ergonomic win), then C, D, E (security), then patch fuzz.
+
 ## Order of work
 1. Finish ignore rules and make the workspace package compile.
 2. Glob result shape and `server_capabilities`.

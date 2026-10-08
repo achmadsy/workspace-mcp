@@ -7,3 +7,4 @@ testdata/workspace/*_link
 testdata/workspace/sub/parent_escape
 testdata/workspace/binary.bin
 *.log
+.claude/

@@ -74,8 +74,44 @@ uncompiled and untested. Run `go build ./... && go test ./...` before committing
       restart and re-adding the connector (existing tokens keep their old scope). Trade-off: no
       per-scope choice for clients that ask for plain `workspace`.
 
+## Build and test pass for section 6 (2026-10-08)
+`workspace:exec` now works (the step 5 scope expansion took effect). The sandbox PATH has Go 1.20.7,
+so builds use the project toolchain: `GOROOT=/workspace/.tools/go`, `GOTOOLCHAIN=local`.
+- `go build ./...`: pass (all five steps above compile).
+- `go vet ./...`: clean.
+- `go test ./...` under the sandbox default umask 0077: all pass except
+  `TestSecureCredentialFile` (config) and `TestCredentialBrokerRejectsUnsafeFiles` (git).
+  Cause is environmental: the tests create a 0o644 file, umask 0077 makes it 0600, so the
+  "world-readable" case is not world-readable. With `umask 022`, config, git and sandboxexec pass.
+- Not yet run: full `go test ./...` under umask 022 in one pass, and a live server restart.
+- Suggested: make those two tests `os.Chmod` after `WriteFile` so they do not depend on umask.
+
+## Implementation of plan.md section 7 (approved: "A and B then continue")
+Verified with the project Go 1.25 toolchain: `go test -count=1 ./...` passes under the sandbox
+default umask 0077; `go test -race ./internal/sandboxexec` passes; `gofmt -l` and `go vet` are clean;
+`scripts/check.sh` passes. None of this is committed. The running server still has the old binary:
+rebuild and restart it for A and B to take effect.
+- [x] A: network start retry allowlist (`setegid` and `setns(CLONE_NEWNET)` signatures), 5 attempts,
+      attempt count in logs and final error. The startup downgrade stays limited to the
+      mount-sandbox signature. Tests added in `runner_test.go`.
+- [x] B: finished jobs no longer count against `ExecMaxJobs`; bounded finished ring (32) that evicts
+      read jobs first; bounded tombstones so `exec_status` explains why output is gone. Replaced
+      `TestJobsEvictsOldestFinishedJobWhenFull` with three tests in `jobs_test.go`.
+- [x] F: `gofmt` of `authorize.go`; `startNetworkWithRetry` returns `networkStartResult`;
+      new `scripts/check.sh`.
+- [x] G: the two credential tests `os.Chmod` explicitly, so they no longer depend on umask.
+- [x] H: `.claude/` added to `.gitignore`.
+
+## Startup dependency validation
+- `scripts/start-tunnel.sh` now reports all missing Quick Tunnel and `--agentic` binaries together
+  before changing state, maps them to Debian/Ubuntu/WSL2 package names, links the official
+  cloudflared downloads page, and includes WSL2 systemd guidance.
+- Validated shell syntax and the full missing-dependency output with an isolated PATH.
+
 ## Remaining
-- Review diff and commit when requested.
+- Section 6 is already committed in 4c5dfcc; the "uncommitted" and "uncompiled" wording above is stale.
+- Re-review 2 (2026-10-08): findings A to H and ergonomics items are in plan.md section 7.
+  Nothing in the code was changed. Waiting for approval before implementing.
 - Seccomp filter for sandboxed workload itself remains optional future work; current slirp4netns
   helper seccomp is enabled where supported.
 - Optional host-level egress policy remains future work.

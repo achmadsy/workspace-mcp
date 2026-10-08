@@ -73,6 +73,10 @@ func TestCredentialBrokerRejectsUnsafeFiles(t *testing.T) {
 	if err := os.WriteFile(path, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile applies the umask; chmod makes the mode explicit.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := newCredentialBroker(config.Config{
 		EnableGitNetwork: true, GitCredentialMode: "https_token", GitCredentialFile: path,
 	}); err == nil {

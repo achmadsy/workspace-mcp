@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -46,14 +48,35 @@ type JobStatus struct {
 	CompletedAt        string `json:"completed_at,omitempty"`
 }
 
+const (
+	// defaultFinishedJobsRetained bounds finished jobs kept for later reads. Only
+	// queued and running jobs count against ExecMaxJobs, so finished jobs never
+	// block new work.
+	defaultFinishedJobsRetained = 32
+	// tombstonesRetained bounds the record of dropped jobs, which lets
+	// exec_status say why a job's output is gone instead of "not found".
+	tombstonesRetained = 256
+)
+
+// tombstone remembers a job that was dropped from the table.
+type tombstone struct {
+	owner    string
+	state    JobState
+	exitCode int
+	reason   string
+}
+
 type Jobs struct {
-	runner *Runner
-	run    func(context.Context, Request, map[string]string, bool, *limitBuffer, *limitBuffer, func()) (Result, error)
-	mu     sync.Mutex
-	jobs   map[string]*job
-	closed bool
-	now    func() time.Time
-	wg     sync.WaitGroup
+	runner         *Runner
+	run            func(context.Context, Request, map[string]string, bool, *limitBuffer, *limitBuffer, func()) (Result, error)
+	mu             sync.Mutex
+	jobs           map[string]*job
+	maxFinished    int
+	tombstones     map[string]tombstone
+	tombstoneOrder []string
+	closed         bool
+	now            func() time.Time
+	wg             sync.WaitGroup
 }
 
 type job struct {
@@ -68,13 +91,19 @@ type job struct {
 	result      Result
 	err         error
 	cancel      context.CancelFunc
+	// read is set once the job has finished and a status call returned its
+	// output, so it is the preferred victim when finished jobs are trimmed.
+	read bool
 }
 
 func NewJobs(runner *Runner) (*Jobs, error) {
 	if runner == nil {
 		return nil, errors.New("sandbox runner is required")
 	}
-	return &Jobs{runner: runner, run: runner.runWithBuffers, jobs: make(map[string]*job), now: time.Now}, nil
+	return &Jobs{
+		runner: runner, run: runner.runWithBuffers, jobs: make(map[string]*job),
+		maxFinished: defaultFinishedJobsRetained, tombstones: make(map[string]tombstone), now: time.Now,
+	}, nil
 }
 
 func (m *Jobs) Start(owner string, request Request) (JobStatus, error) {
@@ -109,14 +138,9 @@ func (m *Jobs) Start(owner string, request Request) (JobStatus, error) {
 		return JobStatus{}, errors.New("job manager is closed")
 	}
 	m.evictLocked(now)
-	if len(m.jobs) >= m.runner.cfg.ExecMaxJobs {
-		// Finished jobs must not lock out new work until their TTL expires:
-		// drop the oldest finished job to make room. Running jobs are never evicted.
-		m.evictOldestTerminalLocked()
-	}
-	if len(m.jobs) >= m.runner.cfg.ExecMaxJobs {
+	if m.activeLocked() >= m.runner.cfg.ExecMaxJobs {
 		cancel()
-		return JobStatus{}, errors.New("job capacity reached")
+		return JobStatus{}, fmt.Errorf("job capacity reached: %d jobs are queued or running; wait for one to finish or cancel one", m.runner.cfg.ExecMaxJobs)
 	}
 	m.jobs[id] = j
 	m.wg.Add(1)
@@ -135,7 +159,52 @@ func (m *Jobs) Status(owner, id string, stdoutCursor, stderrCursor int) (JobStat
 	if err != nil {
 		return JobStatus{}, err
 	}
-	return m.statusLocked(j, stdoutCursor, stderrCursor)
+	status, err := m.statusLocked(j, stdoutCursor, stderrCursor)
+	if err == nil && terminalState(j.state) {
+		j.read = true
+	}
+	return status, err
+}
+
+// waitPollInterval is how often Wait re-checks a job. The check is cheap (it
+// compares buffer lengths and does not copy output).
+const waitPollInterval = 25 * time.Millisecond
+
+// Wait is Status that first waits, up to wait, for the job to finish or for output
+// to appear past the given cursors, so a client does not have to poll. wait is
+// capped at the configured synchronous exec timeout, which is always below the
+// HTTP timeout. A zero or negative wait behaves exactly like Status.
+func (m *Jobs) Wait(ctx context.Context, owner, id string, stdoutCursor, stderrCursor int, wait time.Duration) (JobStatus, error) {
+	if limit := m.runner.cfg.ExecTimeout; wait > limit {
+		wait = limit
+	}
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		tick := time.NewTicker(waitPollInterval)
+		defer tick.Stop()
+	poll:
+		for {
+			m.mu.Lock()
+			m.evictLocked(m.now())
+			j, err := m.ownedJobLocked(owner, id)
+			// A cursor that differs from the stream length is either new output or
+			// invalid; Status below reports it, so neither is worth waiting on.
+			ready := err != nil || terminalState(j.state) || j.stdout.Total() != stdoutCursor || j.stderr.Total() != stderrCursor
+			m.mu.Unlock()
+			if ready {
+				break
+			}
+			select {
+			case <-tick.C:
+			case <-timer.C:
+				break poll
+			case <-ctx.Done():
+				break poll
+			}
+		}
+	}
+	return m.Status(owner, id, stdoutCursor, stderrCursor)
 }
 
 func (m *Jobs) Cancel(owner, id string) (JobStatus, error) {
@@ -202,6 +271,7 @@ func (m *Jobs) execute(ctx context.Context, j *job, request Request) {
 	default:
 		j.state = JobSucceeded
 	}
+	m.trimFinishedLocked()
 }
 
 func (m *Jobs) statusLocked(j *job, stdoutCursor, stderrCursor int) (JobStatus, error) {
@@ -236,35 +306,74 @@ func (m *Jobs) statusLocked(j *job, stdoutCursor, stderrCursor int) (JobStatus, 
 
 func (m *Jobs) ownedJobLocked(owner, id string) (*job, error) {
 	j, ok := m.jobs[id]
-	if !ok || owner == "" || j.owner != owner {
-		return nil, errors.New("job not found")
+	if ok && owner != "" && j.owner == owner {
+		return j, nil
 	}
-	return j, nil
+	if !ok && owner != "" {
+		if t, dropped := m.tombstones[id]; dropped && t.owner == owner {
+			return nil, fmt.Errorf("job output is no longer available: %s (state %s, exit code %d)", t.reason, t.state, t.exitCode)
+		}
+	}
+	return nil, errors.New("job not found")
 }
 
 func (m *Jobs) evictLocked(now time.Time) {
-	for id, j := range m.jobs {
+	for _, j := range m.jobs {
 		if terminalState(j.state) && now.Sub(j.completedAt) >= m.runner.cfg.ExecJobTTL {
-			delete(m.jobs, id)
+			m.dropLocked(j, fmt.Sprintf("expired after %s", m.runner.cfg.ExecJobTTL))
 		}
 	}
 }
 
-// evictOldestTerminalLocked removes the finished job that completed earliest.
-// It does nothing when every job is still queued or running.
-func (m *Jobs) evictOldestTerminalLocked() {
-	var oldestID string
-	var oldest time.Time
-	for id, j := range m.jobs {
+// activeLocked counts queued and running jobs, the only ones limited by ExecMaxJobs.
+func (m *Jobs) activeLocked() int {
+	n := 0
+	for _, j := range m.jobs {
 		if !terminalState(j.state) {
-			continue
-		}
-		if oldestID == "" || j.completedAt.Before(oldest) {
-			oldestID, oldest = id, j.completedAt
+			n++
 		}
 	}
-	if oldestID != "" {
-		delete(m.jobs, oldestID)
+	return n
+}
+
+// trimFinishedLocked keeps at most maxFinished finished jobs. Jobs whose output
+// was already read go first, then the oldest unread ones.
+func (m *Jobs) trimFinishedLocked() {
+	var finished []*job
+	for _, j := range m.jobs {
+		if terminalState(j.state) {
+			finished = append(finished, j)
+		}
+	}
+	excess := len(finished) - m.maxFinished
+	if excess <= 0 {
+		return
+	}
+	sort.Slice(finished, func(a, b int) bool {
+		x, y := finished[a], finished[b]
+		if x.read != y.read {
+			return x.read
+		}
+		if !x.completedAt.Equal(y.completedAt) {
+			return x.completedAt.Before(y.completedAt)
+		}
+		return x.id < y.id
+	})
+	for _, j := range finished[:excess] {
+		m.dropLocked(j, fmt.Sprintf("evicted to keep at most %d finished jobs", m.maxFinished))
+	}
+}
+
+// dropLocked removes a job and leaves a bounded tombstone behind.
+func (m *Jobs) dropLocked(j *job, reason string) {
+	delete(m.jobs, j.id)
+	if _, exists := m.tombstones[j.id]; !exists {
+		m.tombstoneOrder = append(m.tombstoneOrder, j.id)
+	}
+	m.tombstones[j.id] = tombstone{owner: j.owner, state: j.state, exitCode: j.result.ExitCode, reason: reason}
+	for len(m.tombstoneOrder) > tombstonesRetained {
+		delete(m.tombstones, m.tombstoneOrder[0])
+		m.tombstoneOrder = m.tombstoneOrder[1:]
 	}
 }
 

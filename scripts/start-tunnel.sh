@@ -35,26 +35,62 @@ fi
 WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd)"
 export WORKSPACE_ROOT
 
-for command_name in cloudflared openssl curl python3 sha256sum tar; do
-  command -v "$command_name" >/dev/null 2>&1 || {
-    echo "$command_name not found; install it before starting the Quick Tunnel" >&2
-    exit 1
-  }
+QUICK_MISSING=""
+BASE_PACKAGES=""
+for command_name in cloudflared openssl curl python3 sha256sum tar git; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    QUICK_MISSING="${QUICK_MISSING}${QUICK_MISSING:+ }$command_name"
+    case "$command_name" in
+      openssl|curl|python3|tar|git) BASE_PACKAGES="${BASE_PACKAGES}${BASE_PACKAGES:+ }$command_name" ;;
+      sha256sum) BASE_PACKAGES="${BASE_PACKAGES}${BASE_PACKAGES:+ }coreutils" ;;
+    esac
+  fi
 done
 
+AGENTIC_MISSING=""
+AGENTIC_PACKAGES=""
 if [ "$AGENTIC" = true ]; then
   for command_name in bwrap slirp4netns systemd-run prlimit; do
-    command -v "$command_name" >/dev/null 2>&1 || {
-      echo "$command_name not found; --agentic requires bubblewrap, slirp4netns, systemd-run, and prlimit" >&2
-      exit 1
-    }
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      AGENTIC_MISSING="${AGENTIC_MISSING}${AGENTIC_MISSING:+ }$command_name"
+      case "$command_name" in
+        bwrap) AGENTIC_PACKAGES="${AGENTIC_PACKAGES}${AGENTIC_PACKAGES:+ }bubblewrap" ;;
+        slirp4netns) AGENTIC_PACKAGES="${AGENTIC_PACKAGES}${AGENTIC_PACKAGES:+ }slirp4netns" ;;
+        systemd-run) AGENTIC_PACKAGES="${AGENTIC_PACKAGES}${AGENTIC_PACKAGES:+ }systemd" ;;
+        prlimit) AGENTIC_PACKAGES="${AGENTIC_PACKAGES}${AGENTIC_PACKAGES:+ }util-linux" ;;
+      esac
+    fi
   done
+fi
+
+if [ -n "$QUICK_MISSING" ] || [ -n "$AGENTIC_MISSING" ]; then
+  echo "Missing startup dependencies:" >&2
+  [ -n "$QUICK_MISSING" ] && echo "  Quick Tunnel: $QUICK_MISSING" >&2
+  [ -n "$AGENTIC_MISSING" ] && echo "  Agentic mode: $AGENTIC_MISSING" >&2
+  echo "" >&2
+  echo "Install the missing dependencies, then rerun this command." >&2
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    echo "  cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" >&2
+  fi
+  if [ -n "$BASE_PACKAGES" ]; then
+    echo "  Debian/Ubuntu/WSL2: sudo apt-get update && sudo apt-get install -y $BASE_PACKAGES" >&2
+  fi
+  if [ -n "$AGENTIC_PACKAGES" ]; then
+    echo "  Agentic packages: sudo apt-get update && sudo apt-get install -y $AGENTIC_PACKAGES" >&2
+  fi
+  if [ "$AGENTIC" = true ] && ! command -v systemd-run >/dev/null 2>&1; then
+    echo "  WSL2 also needs systemd enabled in /etc/wsl.conf; then run 'wsl --shutdown' from Windows." >&2
+  fi
+  exit 1
+fi
+
+if [ "$AGENTIC" = true ]; then
   if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
-    echo "--agentic requires cgroup v2" >&2
+    echo "--agentic requires cgroup v2. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
     exit 1
   fi
   if ! systemd-run --user --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
-    echo "--agentic requires a usable user systemd manager and delegated cgroup scope" >&2
+    echo "--agentic requires a usable user systemd manager and delegated cgroup scope. On WSL2, enable systemd in /etc/wsl.conf, run 'wsl --shutdown' from Windows, then retry." >&2
     exit 1
   fi
   export MCP_ENABLE_EXEC=true

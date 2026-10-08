@@ -71,6 +71,7 @@ type jobStatusInput struct {
 	ID           string `json:"id" jsonschema:"Job ID"`
 	StdoutCursor int    `json:"stdout_cursor,omitempty" jsonschema:"Previously returned stdout cursor"`
 	StderrCursor int    `json:"stderr_cursor,omitempty" jsonschema:"Previously returned stderr cursor"`
+	WaitMS       int    `json:"wait_ms,omitempty" jsonschema:"Wait up to this many milliseconds for the job to finish or produce new output before answering; capped at the server exec timeout"`
 }
 type jobInput struct {
 	ID string `json:"id" jsonschema:"Job ID"`
@@ -285,12 +286,12 @@ func registerExecTools(s *mcp.Server, cfg config.Config, runner *sandboxexec.Run
 			auditTool(req, "exec_start", "client_id", owner, "command_digest", commandDigest(in), "cwd", in.Cwd, "job_id", out.ID, "error", err != nil)
 			return nil, out, err
 		})
-	mcp.AddTool(s, tool("exec_status", "Read retained incremental output and status for an owner-bound sandbox job.", "Show sandbox job", true, nil, true, &open),
-		func(_ context.Context, req *mcp.CallToolRequest, in jobStatusInput) (*mcp.CallToolResult, sandboxexec.JobStatus, error) {
+	mcp.AddTool(s, tool("exec_status", "Read retained incremental output and status for an owner-bound sandbox job. Pass wait_ms to wait for completion or new output instead of polling.", "Show sandbox job", true, nil, true, &open),
+		func(ctx context.Context, req *mcp.CallToolRequest, in jobStatusInput) (*mcp.CallToolResult, sandboxexec.JobStatus, error) {
 			if err := requireScope(cfg, req, "workspace:exec"); err != nil {
 				return nil, sandboxexec.JobStatus{}, err
 			}
-			out, err := jobs.Status(toolOwner(cfg, req), in.ID, in.StdoutCursor, in.StderrCursor)
+			out, err := jobs.Wait(ctx, toolOwner(cfg, req), in.ID, in.StdoutCursor, in.StderrCursor, time.Duration(in.WaitMS)*time.Millisecond)
 			return nil, out, err
 		})
 	mcp.AddTool(s, tool("exec_cancel", "Cancel an owner-bound sandbox job and its descendants.", "Cancel sandbox job", false, &destructive, true, &open),

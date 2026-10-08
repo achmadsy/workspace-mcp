@@ -118,14 +118,29 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 	return r, nil
 }
 
+// slirpMountSandboxFailure recognizes the slirp4netns mount-sandbox failure seen
+// on WSL2: `setegid(0) ... parent failed`.
+func slirpMountSandboxFailure(text string) bool {
+	return strings.Contains(text, "setegid(0)") && strings.Contains(text, "parent failed")
+}
+
+// slirpNamespaceJoinFailure recognizes slirp4netns failing to enter the
+// sandbox's network namespace: `setns(CLONE_NEWNET): Operation not permitted`.
+// It succeeds on an immediate retry, so it looks like a startup race.
+func slirpNamespaceJoinFailure(text string) bool {
+	return strings.Contains(text, "setns(CLONE_NEWNET)") && strings.Contains(text, "Operation not permitted")
+}
+
+// shouldRetryWithoutSlirpSandbox reports whether startup may drop the slirp4netns
+// mount-sandbox layer. Only the mount-sandbox signature qualifies: a namespace
+// join failure says nothing about that layer, so it is retried (see
+// isTransientNetworkStartFailure) but never weakens the hardening.
 func shouldRetryWithoutSlirpSandbox(err error) bool {
 	if err == nil {
 		return false
 	}
 	message := err.Error()
-	return strings.Contains(message, "isolated network helper") &&
-		strings.Contains(message, "setegid(0)") &&
-		strings.Contains(message, "parent failed")
+	return strings.Contains(message, "isolated network helper") && slirpMountSandboxFailure(message)
 }
 
 func (r *Runner) Config() config.Config { return r.cfg }
@@ -353,12 +368,13 @@ func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, command
 		return <-commandDone, nil
 	}
 
-	network, startRunErr, err := r.startNetworkWithRetry(ctx, cmd, childPID, commandDone, errOut)
-	if network == nil {
-		// Helper failure (err), sandbox exit (startRunErr and err), or context end
-		// while starting (startRunErr only).
-		return startRunErr, err
+	started := r.startNetworkWithRetry(ctx, cmd, childPID, commandDone, errOut)
+	if started.network == nil {
+		// Helper failure (err), sandbox exit (runErr and err), or context end
+		// while starting (runErr only).
+		return started.runErr, started.err
 	}
+	network := started.network
 	defer network.stop()
 
 	if _, err := blockWriter.Write([]byte{1}); err != nil {
@@ -383,16 +399,24 @@ func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, command
 }
 
 const (
-	networkStartAttempts     = 3
+	networkStartAttempts     = 5
 	networkStartBackoff      = 50 * time.Millisecond
 	networkHelperStderrLimit = 4096
 )
 
 // isTransientNetworkStartFailure recognizes the intermittent slirp4netns start
-// failure seen on WSL2 (`setegid(0) ... parent failed`), which is retried with
-// the same hardening instead of weakening it. Unrelated failures are not retried.
+// failures seen on WSL2 (an allowlist of known signatures), which are retried
+// with the same hardening instead of weakening it. Unrelated failures are not
+// retried.
 func isTransientNetworkStartFailure(helperStderr string) bool {
-	return strings.Contains(helperStderr, "setegid(0)") && strings.Contains(helperStderr, "parent failed")
+	return slirpMountSandboxFailure(helperStderr) || slirpNamespaceJoinFailure(helperStderr)
+}
+
+// networkStartResult is the outcome of startNetworkWithRetry.
+type networkStartResult struct {
+	network *networkProcess
+	runErr  error
+	err     error
 }
 
 // startNetworkWithRetry starts the slirp4netns helper for the (still blocked)
@@ -402,21 +426,24 @@ func isTransientNetworkStartFailure(helperStderr string) bool {
 // attempt and only added to errOut when the final attempt fails, so a recovered
 // retry leaves no stale error text in the command's own stderr.
 //
-// Results: (network, nil, nil) when ready; (nil, runErr, err) when the sandbox
-// exited first; (nil, runErr, nil) when the context ended; (nil, nil, err) when
-// the helper failed for good.
-func (r *Runner) startNetworkWithRetry(ctx context.Context, cmd *exec.Cmd, childPID int, commandDone <-chan error, errOut *limitBuffer) (*networkProcess, error, error) {
+// The result has network set when the helper is ready. Otherwise runErr holds
+// the sandbox exit status when it exited (err is set too) or the context ended
+// (err is nil), and err alone means the helper failed for good.
+func (r *Runner) startNetworkWithRetry(ctx context.Context, cmd *exec.Cmd, childPID int, commandDone <-chan error, errOut *limitBuffer) networkStartResult {
 	for attempt := 1; ; attempt++ {
 		helperErr := &limitBuffer{limit: networkHelperStderrLimit}
 		network, err := r.startNetwork(ctx, childPID, helperErr)
 		if err != nil {
-			return nil, nil, err
+			return networkStartResult{err: err}
 		}
 		var failure error
 		select {
 		case readyOK := <-network.ready:
 			if readyOK {
-				return network, nil, nil
+				if attempt > 1 {
+					slog.Info("slirp4netns started after retry", "attempts", attempt)
+				}
+				return networkStartResult{network: network}
 			}
 			failure = errors.New("isolated network helper closed its readiness pipe")
 		case doneErr := <-network.done:
@@ -427,27 +454,31 @@ func (r *Runner) startNetworkWithRetry(ctx context.Context, cmd *exec.Cmd, child
 			}
 		case runErr := <-commandDone:
 			network.stop()
-			return nil, runErr, errors.New("sandbox exited before network became ready")
+			return networkStartResult{runErr: runErr, err: errors.New("sandbox exited before network became ready")}
 		case <-ctx.Done():
 			network.stop()
 			cancelProcessGroup(cmd)
-			return nil, <-commandDone, nil
+			return networkStartResult{runErr: <-commandDone}
 		}
 		// stop waits for the helper to exit, so its stderr is complete below.
 		network.stop()
 		stderrText := helperErr.String()
 		if attempt >= networkStartAttempts || !isTransientNetworkStartFailure(stderrText) {
 			_, _ = errOut.Write([]byte(stderrText))
-			return nil, nil, failure
+			if attempt > 1 {
+				failure = fmt.Errorf("%w (after %d attempts)", failure, attempt)
+			}
+			return networkStartResult{err: failure}
 		}
-		slog.Warn("slirp4netns start failed with a known transient error; retrying", "attempt", attempt)
+		slog.Warn("slirp4netns start failed with a known transient error; retrying",
+			"attempt", attempt, "of", networkStartAttempts, "helper_stderr", strings.TrimSpace(stderrText))
 		select {
 		case <-time.After(time.Duration(attempt) * networkStartBackoff):
 		case runErr := <-commandDone:
-			return nil, runErr, errors.New("sandbox exited before network became ready")
+			return networkStartResult{runErr: runErr, err: errors.New("sandbox exited before network became ready")}
 		case <-ctx.Done():
 			cancelProcessGroup(cmd)
-			return nil, <-commandDone, nil
+			return networkStartResult{runErr: <-commandDone}
 		}
 	}
 }
@@ -958,6 +989,16 @@ func (b *limitBuffer) Slice(offset int) (string, int, bool, error) {
 		return "", len(data), b.truncated, errors.New("output cursor is outside retained data")
 	}
 	return string(data[offset:]), len(data), b.truncated, nil
+}
+
+// Total reports the absolute stream length: the cursor a reader at the end would hold.
+func (b *limitBuffer) Total() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.mode == bufferRolling {
+		return b.dropped + b.b.Len()
+	}
+	return b.b.Len()
 }
 
 // Dropped reports how many bytes were omitted from the retained output.

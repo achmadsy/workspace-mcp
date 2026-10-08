@@ -45,7 +45,9 @@ func TestIsTransientNetworkStartFailure(t *testing.T) {
 		want   bool
 	}{
 		{name: "known race", stderr: "setegid(0): Operation not permitted\nparent failed\n", want: true},
+		{name: "namespace join race", stderr: "setns(CLONE_NEWNET): Operation not permitted\nchild failed(1)\n", want: true},
 		{name: "only setegid", stderr: "setegid(0) failed"},
+		{name: "setns with another error", stderr: "setns(CLONE_NEWNET): No such file or directory"},
 		{name: "unrelated", stderr: "pivot_root: Permission denied"},
 		{name: "empty"},
 	} {
@@ -420,5 +422,17 @@ func TestLimitBufferRollingCursors(t *testing.T) {
 	}
 	if _, _, _, err := buffer.Slice(9); err == nil {
 		t.Fatal("cursor beyond the stream accepted")
+	}
+}
+
+func TestNamespaceJoinFailureDoesNotDowngradeSlirpSandbox(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("isolated network helper closed its readiness pipe (stderr: setns(CLONE_NEWNET): Operation not permitted | child failed(1))")
+	if shouldRetryWithoutSlirpSandbox(err) {
+		t.Fatal("a namespace join failure must not weaken slirp4netns hardening")
+	}
+	if !isTransientNetworkStartFailure("setns(CLONE_NEWNET): Operation not permitted") {
+		t.Fatal("namespace join failure is not retried")
 	}
 }
