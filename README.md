@@ -222,16 +222,19 @@ Never use local mode behind a tunnel.
 ./scripts/start-tunnel.sh /path/to/project
 ```
 
-By default the launcher runs inside a detached tmux session named
-`workspace-mcp-tunnel` and returns immediately:
+By default the launcher runs inside a dedicated detached tmux server and a
+session named `workspace-mcp-tunnel`, then returns immediately:
 
 ```bash
-tmux attach -t workspace-mcp-tunnel   # watch logs / interact
-tmux kill-session -t workspace-mcp-tunnel   # stop tunnel and server
+tmux -L workspace-mcp attach -t workspace-mcp-tunnel   # watch logs / interact
+tmux -L workspace-mcp kill-server   # stop tunnel and server
 ```
 
-Add `--fg` to run in the calling terminal instead (Ctrl+C stops both
-processes). A custom session name can be set with `WORKSPACE_MCP_SESSION`.
+The dedicated tmux server preserves the launcher's current login environment
+and avoids inheriting confinement from an existing tmux server. Add `--fg` to
+run in the calling terminal instead (Ctrl+C stops both processes). Set a custom
+session name with `WORKSPACE_MCP_SESSION` or socket name with
+`WORKSPACE_MCP_TMUX_SOCKET`.
 
 This one command checks startup dependencies first and prints install guidance
 for anything missing, including `cloudflared` and all `--agentic` helpers. It
