@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -90,15 +91,23 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 		return nil, errors.New("sandbox helpers were not configured")
 	}
 	r := &Runner{cfg: cfg, root: root, sem: make(chan struct{}, limits.MaxExecConcurrency)}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	testRequest := Request{Script: selfTestScript, TimeoutMS: 4000}
-	var res Result
-	var err error
-	if cfg.EnableExec || cfg.EnableGitNetwork {
-		res, err = r.Run(ctx, testRequest, nil)
-	} else {
-		res, err = r.RunIsolated(ctx, testRequest, nil)
+	runSelfTest := func() (Result, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if r.cfg.EnableExec || r.cfg.EnableGitNetwork {
+			return r.Run(ctx, testRequest, nil)
+		}
+		return r.RunIsolated(ctx, testRequest, nil)
+	}
+	res, err := runSelfTest()
+	if err != nil && cfg.SlirpSandbox && shouldRetryWithoutSlirpSandbox(err) {
+		initialErr := err
+		r.cfg.SlirpSandbox = false
+		res, err = runSelfTest()
+		if err == nil {
+			slog.Warn("slirp4netns sandbox hardening unavailable; continuing with seccomp", "initial_error", initialErr)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("sandbox self-test failed: %w", err)
@@ -107,6 +116,16 @@ func New(cfg config.Config, root *workspace.Root) (*Runner, error) {
 		return nil, fmt.Errorf("sandbox self-test failed with exit code %d (11 workspace, 12 /root visible, 13 /etc/shadow visible, 14 /home not empty, 15 /run/user visible, 16 /etc/passwd missing): %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return r, nil
+}
+
+func shouldRetryWithoutSlirpSandbox(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "isolated network helper") &&
+		strings.Contains(message, "setegid(0)") &&
+		strings.Contains(message, "parent failed")
 }
 
 func (r *Runner) Config() config.Config { return r.cfg }
@@ -229,7 +248,7 @@ func (r *Runner) runWithBuffersAndCredentials(ctx context.Context, request Reque
 			cancelProcessGroup(cmd)
 			r.killUnit(unit)
 			<-commandDone
-			return Result{}, err
+			return Result{}, annotateSandboxError(err, runErr, errOut)
 		}
 	} else {
 		runErr = <-commandDone
@@ -334,32 +353,18 @@ func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, command
 		return <-commandDone, nil
 	}
 
-	network, err := r.startNetwork(ctx, childPID, errOut)
-	if err != nil {
-		return nil, err
+	network, startRunErr, err := r.startNetworkWithRetry(ctx, cmd, childPID, commandDone, errOut)
+	if network == nil {
+		// Helper failure (err), sandbox exit (startRunErr and err), or context end
+		// while starting (startRunErr only).
+		return startRunErr, err
 	}
 	defer network.stop()
 
-	select {
-	case readyOK := <-network.ready:
-		if !readyOK {
-			return nil, errors.New("isolated network helper closed its readiness pipe")
-		}
-		if _, err := blockWriter.Write([]byte{1}); err != nil {
-			return nil, errors.New("sandbox startup synchronization failed")
-		}
-		_ = blockWriter.Close()
-	case err := <-network.done:
-		if err == nil {
-			return nil, errors.New("isolated network helper exited before readiness")
-		}
-		return nil, fmt.Errorf("isolated network helper exited before readiness: %w", err)
-	case runErr := <-commandDone:
-		return runErr, errors.New("sandbox exited before network became ready")
-	case <-ctx.Done():
-		cancelProcessGroup(cmd)
-		return <-commandDone, nil
+	if _, err := blockWriter.Write([]byte{1}); err != nil {
+		return nil, errors.New("sandbox startup synchronization failed")
 	}
+	_ = blockWriter.Close()
 
 	select {
 	case runErr := <-commandDone:
@@ -374,6 +379,76 @@ func (r *Runner) runNetworkHandshake(ctx context.Context, cmd *exec.Cmd, command
 	case <-ctx.Done():
 		cancelProcessGroup(cmd)
 		return <-commandDone, nil
+	}
+}
+
+const (
+	networkStartAttempts     = 3
+	networkStartBackoff      = 50 * time.Millisecond
+	networkHelperStderrLimit = 4096
+)
+
+// isTransientNetworkStartFailure recognizes the intermittent slirp4netns start
+// failure seen on WSL2 (`setegid(0) ... parent failed`), which is retried with
+// the same hardening instead of weakening it. Unrelated failures are not retried.
+func isTransientNetworkStartFailure(helperStderr string) bool {
+	return strings.Contains(helperStderr, "setegid(0)") && strings.Contains(helperStderr, "parent failed")
+}
+
+// startNetworkWithRetry starts the slirp4netns helper for the (still blocked)
+// sandbox child and waits until it is ready. A known transient start failure is
+// retried a bounded number of times; the sandbox stays blocked on its block-fd
+// the whole time, so a retry exposes nothing. Helper stderr is captured per
+// attempt and only added to errOut when the final attempt fails, so a recovered
+// retry leaves no stale error text in the command's own stderr.
+//
+// Results: (network, nil, nil) when ready; (nil, runErr, err) when the sandbox
+// exited first; (nil, runErr, nil) when the context ended; (nil, nil, err) when
+// the helper failed for good.
+func (r *Runner) startNetworkWithRetry(ctx context.Context, cmd *exec.Cmd, childPID int, commandDone <-chan error, errOut *limitBuffer) (*networkProcess, error, error) {
+	for attempt := 1; ; attempt++ {
+		helperErr := &limitBuffer{limit: networkHelperStderrLimit}
+		network, err := r.startNetwork(ctx, childPID, helperErr)
+		if err != nil {
+			return nil, nil, err
+		}
+		var failure error
+		select {
+		case readyOK := <-network.ready:
+			if readyOK {
+				return network, nil, nil
+			}
+			failure = errors.New("isolated network helper closed its readiness pipe")
+		case doneErr := <-network.done:
+			if doneErr == nil {
+				failure = errors.New("isolated network helper exited before readiness")
+			} else {
+				failure = fmt.Errorf("isolated network helper exited before readiness: %w", doneErr)
+			}
+		case runErr := <-commandDone:
+			network.stop()
+			return nil, runErr, errors.New("sandbox exited before network became ready")
+		case <-ctx.Done():
+			network.stop()
+			cancelProcessGroup(cmd)
+			return nil, <-commandDone, nil
+		}
+		// stop waits for the helper to exit, so its stderr is complete below.
+		network.stop()
+		stderrText := helperErr.String()
+		if attempt >= networkStartAttempts || !isTransientNetworkStartFailure(stderrText) {
+			_, _ = errOut.Write([]byte(stderrText))
+			return nil, nil, failure
+		}
+		slog.Warn("slirp4netns start failed with a known transient error; retrying", "attempt", attempt)
+		select {
+		case <-time.After(time.Duration(attempt) * networkStartBackoff):
+		case runErr := <-commandDone:
+			return nil, runErr, errors.New("sandbox exited before network became ready")
+		case <-ctx.Done():
+			cancelProcessGroup(cmd)
+			return nil, <-commandDone, nil
+		}
 	}
 }
 
@@ -399,7 +474,7 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 		"--dir", "/etc",
 		"--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
 		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
-		"--bind", "/proc/self/fd/"+strconv.Itoa(workspaceFD), "/workspace", "--chdir", cwd,
+		"--bind-fd", strconv.Itoa(workspaceFD), "/workspace", "--chdir", cwd,
 	)
 	if network {
 		if r.cfg.Slirp4netnsPath == "" {
@@ -421,15 +496,15 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 	nextFD := fdBase
 	switch {
 	case credentials.SSHKey != nil:
-		keySource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		keyFD := strconv.Itoa(nextFD)
 		secretFiles = append(secretFiles, credentials.SSHKey)
 		nextFD++
-		knownHostsSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		knownHostsFD := strconv.Itoa(nextFD)
 		secretFiles = append(secretFiles, credentials.KnownHosts)
 		args = append(args,
 			"--dir", "/run", "--dir", "/run/workspace-mcp",
-			"--ro-bind", keySource, "/run/workspace-mcp/id",
-			"--ro-bind", knownHostsSource, "/run/workspace-mcp/known_hosts",
+			"--perms", "0400", "--ro-bind-data", keyFD, "/run/workspace-mcp/id",
+			"--perms", "0444", "--ro-bind-data", knownHostsFD, "/run/workspace-mcp/known_hosts",
 		)
 		extraEnv = cloneEnvironment(extraEnv)
 		extraEnv["GIT_SSH_COMMAND"] = "/usr/bin/ssh -i /run/workspace-mcp/id -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/run/workspace-mcp/known_hosts -o GlobalKnownHostsFile=/dev/null -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o BatchMode=yes"
@@ -439,15 +514,15 @@ func (r *Runner) commandArgs(request Request, extraEnv map[string]string, networ
 			return nil, nil, nil, errors.New("create HTTPS credential helper")
 		}
 		generatedFiles = append(generatedFiles, help)
-		helpSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		helpFD := strconv.Itoa(nextFD)
 		secretFiles = append(secretFiles, help)
 		nextFD++
-		tokenSource := "/proc/self/fd/" + strconv.Itoa(nextFD)
+		tokenFD := strconv.Itoa(nextFD)
 		secretFiles = append(secretFiles, credentials.HTTPSToken)
 		args = append(args,
 			"--dir", "/run", "--dir", "/run/workspace-mcp",
-			"--ro-bind", helpSource, "/run/workspace-mcp/askpass",
-			"--ro-bind", tokenSource, "/run/workspace-mcp/token",
+			"--perms", "0500", "--ro-bind-data", helpFD, "/run/workspace-mcp/askpass",
+			"--perms", "0400", "--ro-bind-data", tokenFD, "/run/workspace-mcp/token",
 		)
 		extraEnv = cloneEnvironment(extraEnv)
 		extraEnv["GIT_ASKPASS"] = "/run/workspace-mcp/askpass"
@@ -510,7 +585,9 @@ type etcEntry struct {
 // stub (127.0.0.53) that does not exist inside the private network namespace.
 // With networking, slirp4netns serves DNS at 10.0.2.3. passwd and group give
 // tools such as ssh an entry for the sandbox user. firstFD is the descriptor
-// number the first returned file will have in the child.
+// number the first returned file will have in the child. --ro-bind-data consumes
+// the descriptor directly; /proc/self/fd paths cannot represent deleted memfds
+// reliably because bubblewrap resolves their magic symlinks before mounting.
 func syntheticEtc(network bool, firstFD int) ([]string, []*os.File, error) {
 	uid, gid := os.Getuid(), os.Getgid()
 	passwd := "root:x:0:0:root:/root:/bin/sh\n"
@@ -539,7 +616,7 @@ func syntheticEtc(network bool, firstFD int) ([]string, []*os.File, error) {
 			return nil, nil, err
 		}
 		files = append(files, file)
-		args = append(args, "--ro-bind", "/proc/self/fd/"+strconv.Itoa(firstFD+i), entry.path)
+		args = append(args, "--perms", "0444", "--ro-bind-data", strconv.Itoa(firstFD+i), entry.path)
 	}
 	return args, files, nil
 }
@@ -662,6 +739,28 @@ func (n *networkProcess) stop() {
 	})
 }
 
+// annotateSandboxError adds the sandbox exit status and the tail of its stderr
+// (bwrap, systemd-run and slirp4netns messages) to a startup failure. Without it
+// a failed handshake only says that something exited, not why.
+func annotateSandboxError(err, runErr error, stderr *limitBuffer) error {
+	var details []string
+	if runErr != nil {
+		details = append(details, "exit: "+runErr.Error())
+	}
+	if text := strings.TrimSpace(stderr.String()); text != "" {
+		const maxDetail = 2048
+		if len(text) > maxDetail {
+			text = "..." + text[len(text)-maxDetail:]
+		}
+		text = strings.ToValidUTF8(text, "")
+		details = append(details, "stderr: "+strings.ReplaceAll(text, "\n", " | "))
+	}
+	if len(details) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (%s)", err, strings.Join(details, "; "))
+}
+
 func cancelProcessGroup(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -739,7 +838,7 @@ func safeEnvName(key string) bool {
 }
 
 func buildEnvironment(user, extra map[string]string) []string {
-	values := map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home", "TMPDIR": "/tmp", "LC_ALL": "C", "LANG": "C"}
+	values := map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home", "TMPDIR": "/tmp", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
 	for key, value := range user {
 		values[key] = value
 	}

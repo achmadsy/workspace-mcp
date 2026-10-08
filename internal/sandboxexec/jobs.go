@@ -110,6 +110,11 @@ func (m *Jobs) Start(owner string, request Request) (JobStatus, error) {
 	}
 	m.evictLocked(now)
 	if len(m.jobs) >= m.runner.cfg.ExecMaxJobs {
+		// Finished jobs must not lock out new work until their TTL expires:
+		// drop the oldest finished job to make room. Running jobs are never evicted.
+		m.evictOldestTerminalLocked()
+	}
+	if len(m.jobs) >= m.runner.cfg.ExecMaxJobs {
 		cancel()
 		return JobStatus{}, errors.New("job capacity reached")
 	}
@@ -242,6 +247,24 @@ func (m *Jobs) evictLocked(now time.Time) {
 		if terminalState(j.state) && now.Sub(j.completedAt) >= m.runner.cfg.ExecJobTTL {
 			delete(m.jobs, id)
 		}
+	}
+}
+
+// evictOldestTerminalLocked removes the finished job that completed earliest.
+// It does nothing when every job is still queued or running.
+func (m *Jobs) evictOldestTerminalLocked() {
+	var oldestID string
+	var oldest time.Time
+	for id, j := range m.jobs {
+		if !terminalState(j.state) {
+			continue
+		}
+		if oldestID == "" || j.completedAt.Before(oldest) {
+			oldestID, oldest = id, j.completedAt
+		}
+	}
+	if oldestID != "" {
+		delete(m.jobs, oldestID)
 	}
 }
 

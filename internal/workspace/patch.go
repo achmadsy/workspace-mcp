@@ -234,18 +234,12 @@ func applyHunks(content []byte, hunks []patchHunk) ([]byte, error) {
 	var out []string
 	cursor := 0
 	for _, hunk := range hunks {
-		position := hunk.oldStart - 1
-		if hunk.oldStart == 0 {
-			position = 0
-		}
+		position := hunkPosition(hunk.oldStart, hunk.oldCount)
 		if position < cursor || position > len(lines) {
 			return nil, errors.New("hunk position is outside file")
 		}
 		out = append(out, lines[cursor:position]...)
-		newPosition := hunk.newStart - 1
-		if hunk.newStart == 0 {
-			newPosition = 0
-		}
+		newPosition := hunkPosition(hunk.newStart, hunk.newCount)
 		if newPosition != len(out) {
 			return nil, errors.New("new hunk position does not match output")
 		}
@@ -275,6 +269,17 @@ func applyHunks(content []byte, hunks []patchHunk) ([]byte, error) {
 		result = append(result, '\n')
 	}
 	return result, nil
+}
+
+// hunkPosition converts a unified-diff start and count into a zero-based line
+// index. For a non-empty range the start is the first line of the range; for an
+// empty range (count 0, as in `diff -U0` insertions and deletions) the start is
+// the line before the change, so the index is the start itself.
+func hunkPosition(start, count int) int {
+	if count == 0 || start == 0 {
+		return start
+	}
+	return start - 1
 }
 
 func splitPatchLines(value string) []string {

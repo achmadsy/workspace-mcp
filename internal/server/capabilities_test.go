@@ -51,11 +51,11 @@ func TestBuildCapabilitiesCredentialModeWithoutPaths(t *testing.T) {
 	t.Parallel()
 
 	cfg := config.Config{
-		EnableGitNetwork: true, GitCredentialMode: "ssh",
+		EnableGitNetwork: true, GitCredentialMode: "ssh_key",
 		GitCredentialFile: "/secret/id_ed25519", GitKnownHostsFile: "/secret/known_hosts",
 	}
 	got := buildCapabilities(cfg)
-	if got.GitCredentialMode != "ssh" || !got.GitNetwork {
+	if got.GitCredentialMode != "ssh_key" || !got.GitNetwork {
 		t.Fatalf("capabilities = %#v", got)
 	}
 	raw, err := json.Marshal(got)

@@ -4,6 +4,7 @@ package sandboxexec
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -12,6 +13,50 @@ import (
 
 	"github.com/link/workspace-mcp/internal/config"
 )
+
+func TestShouldRetryWithoutSlirpSandbox(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "known sandbox failure", err: errors.New("isolated network helper closed its readiness pipe (stderr: setegid(0) | parent failed)"), want: true},
+		{name: "unrelated slirp failure", err: errors.New("isolated network helper exited: permission denied")},
+		{name: "sandbox command failure", err: errors.New("sandbox exited before network became ready")},
+		{name: "nil"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldRetryWithoutSlirpSandbox(test.err); got != test.want {
+				t.Fatalf("shouldRetryWithoutSlirpSandbox(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestIsTransientNetworkStartFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{name: "known race", stderr: "setegid(0): Operation not permitted\nparent failed\n", want: true},
+		{name: "only setegid", stderr: "setegid(0) failed"},
+		{name: "unrelated", stderr: "pivot_root: Permission denied"},
+		{name: "empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isTransientNetworkStartFailure(test.stderr); got != test.want {
+				t.Fatalf("isTransientNetworkStartFailure(%q) = %t, want %t", test.stderr, got, test.want)
+			}
+		})
+	}
+}
 
 func TestValidateRequest(t *testing.T) {
 	t.Parallel()
@@ -49,7 +94,7 @@ func TestCommandArgsBuildsCleanEnvironment(t *testing.T) {
 	}
 	joined := strings.Join(args, "\x00")
 	for _, want := range []string{
-		"--json-status-fd\x004", "--block-fd\x005", "/proc/self/fd/3", "/usr/bin/env\x00-i",
+		"--json-status-fd\x004", "--block-fd\x005", "--bind-fd\x003\x00/workspace", "/usr/bin/env\x00-i",
 		"FEATURE=on", "GIT_CONFIG_NOSYSTEM=1", "/usr/bin/printf\x00%s\x00ok",
 	} {
 		if !strings.Contains(joined, want) {
@@ -82,8 +127,8 @@ func TestCommandArgsCredentialMounts(t *testing.T) {
 	defer closeFiles(generated)
 	joined := strings.Join(args, "\x00")
 	for _, want := range []string{
-		"--ro-bind\x00/proc/self/fd/6\x00/run/workspace-mcp/id",
-		"--ro-bind\x00/proc/self/fd/7\x00/run/workspace-mcp/known_hosts",
+		"--perms\x000400\x00--ro-bind-data\x006\x00/run/workspace-mcp/id",
+		"--perms\x000444\x00--ro-bind-data\x007\x00/run/workspace-mcp/known_hosts",
 		"GIT_SSH_COMMAND=/usr/bin/ssh -i /run/workspace-mcp/id",
 	} {
 		if !strings.Contains(joined, want) {
@@ -109,7 +154,8 @@ func TestCommandArgsCredentialMounts(t *testing.T) {
 	defer closeFiles(generated)
 	joined = strings.Join(args, "\x00")
 	for _, want := range []string{
-		"/run/workspace-mcp/askpass", "/run/workspace-mcp/token",
+		"--perms\x000500\x00--ro-bind-data\x006\x00/run/workspace-mcp/askpass",
+		"--perms\x000400\x00--ro-bind-data\x007\x00/run/workspace-mcp/token",
 		"GIT_ASKPASS=/run/workspace-mcp/askpass", "MCP_ASKPASS_TOKEN_FILE=/run/workspace-mcp/token",
 	} {
 		if !strings.Contains(joined, want) {
@@ -241,9 +287,9 @@ func TestCommandArgsHardening(t *testing.T) {
 	for _, want := range []string{
 		"--unshare-all", "--cap-drop\x00ALL", "--unshare-user\x00--disable-userns",
 		"--die-with-parent", "--new-session",
-		"--ro-bind\x00/proc/self/fd/6\x00/etc/passwd",
-		"--ro-bind\x00/proc/self/fd/7\x00/etc/group",
-		"--ro-bind\x00/proc/self/fd/10\x00/etc/resolv.conf",
+		"--perms\x000444\x00--ro-bind-data\x006\x00/etc/passwd",
+		"--perms\x000444\x00--ro-bind-data\x007\x00/etc/group",
+		"--perms\x000444\x00--ro-bind-data\x0010\x00/etc/resolv.conf",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("hardened args missing %q: %q", want, joined)
@@ -269,7 +315,7 @@ func TestCommandArgsHardening(t *testing.T) {
 	}
 	defer closeFiles(generated)
 	joined = strings.Join(args, "\x00")
-	if !strings.Contains(joined, "--ro-bind\x00/proc/self/fd/4\x00/etc/passwd") {
+	if !strings.Contains(joined, "--perms\x000444\x00--ro-bind-data\x004\x00/etc/passwd") {
 		t.Errorf("isolated args do not start /etc files at fd 4: %q", joined)
 	}
 	for _, unwanted := range []string{"/etc/resolv.conf", "--json-status-fd", "--block-fd"} {

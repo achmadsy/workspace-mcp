@@ -43,6 +43,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_request", "client or redirect URI is invalid")
 		return
 	}
+	scope = s.grantedScope(scope)
 	id, err := randomToken()
 	if err != nil {
 		http.Error(w, "authorization failed", 500)
@@ -192,6 +193,20 @@ func pkceOK(verifier, challenge string) bool {
 	sum := sha256.Sum256([]byte(verifier))
 	return secureEqual(base64.RawURLEncoding.EncodeToString(sum[:]), challenge)
 }
+// grantedScope returns the scope string recorded for an authorization request.
+// Some OAuth clients (claude.ai among them) request only the base "workspace"
+// scope and never ask for the optional ones, so a bare "workspace" request is
+// expanded to every scope this server has enabled. The consent page prints the
+// expanded list, so the operator approves it explicitly. A request that names
+// any optional scope is kept exactly as asked.
+func (s *Server) grantedScope(requested string) string {
+	parts := strings.Fields(requested)
+	if len(parts) == 1 && parts[0] == "workspace" {
+		return strings.Join(s.scopes, " ")
+	}
+	return requested
+}
+
 func (s *Server) validScope(v string) bool {
 	parts := strings.Fields(v)
 	if len(parts) == 0 {

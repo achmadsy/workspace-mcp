@@ -46,9 +46,13 @@ Agentic gates add:
 | `MCP_ENABLE_GIT_WRITE` / `workspace:git-write` | `git_add`, `git_restore`, `git_commit`, `git_branch`, `git_switch`, `git_stash_push`, `git_stash_pop` |
 | `MCP_ENABLE_GIT_NETWORK` / `workspace:git-network` | `git_fetch`, `git_pull`, `git_push` |
 
-Existing tool names and response shapes remain compatible. Results are bounded
-and serialized as `structuredContent`; operation failures remain visible MCP tool
-errors rather than transport failures.
+Tool names are stable, but a few response shapes have grown. `workspace_glob`
+returns `{paths, truncated}` plus `truncated_reason` when the list is cut short,
+and returns the sorted partial list instead of an error when a scan or result
+limit is hit. `workspace_search`
+adds `truncated_reason`, `skipped_dirs`, and an `include_ignored` option.
+Results are bounded and serialized as `structuredContent`; operation failures
+remain visible MCP tool errors rather than transport failures.
 
 ## Security model
 

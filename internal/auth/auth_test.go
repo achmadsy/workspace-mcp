@@ -610,6 +610,31 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestGrantedScopeExpandsBareWorkspace(t *testing.T) {
+	s, err := NewServer(testURL, "pw", nil, "workspace:exec", "workspace:git-write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ name, requested, want string }{
+		{"bare workspace expands", "workspace", "workspace workspace:exec workspace:git-write"},
+		{"explicit scopes kept", "workspace workspace:exec", "workspace workspace:exec"},
+		{"extra whitespace expands", "  workspace  ", "workspace workspace:exec workspace:git-write"},
+	} {
+		if got := s.grantedScope(test.requested); got != test.want {
+			t.Errorf("%s: grantedScope(%q) = %q, want %q", test.name, test.requested, got, test.want)
+		}
+	}
+
+	// With no optional gates enabled the expansion is the base scope only.
+	base, err := NewServer(testURL, "pw", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := base.grantedScope("workspace"); got != "workspace" {
+		t.Errorf("base-only server granted %q", got)
+	}
+}
+
 func TestAttemptLimiter(t *testing.T) {
 	l := newAttemptLimiter()
 	now := time.Now()

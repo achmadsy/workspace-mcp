@@ -62,6 +62,45 @@ func TestJobsCancelAndCapacity(t *testing.T) {
 	waitJob(t, manager, "client", created.ID, JobCanceled)
 }
 
+func TestJobsEvictsOldestFinishedJobWhenFull(t *testing.T) {
+	t.Parallel()
+
+	manager := testJobs(t, func(_ context.Context, _ Request, _ map[string]string, _ bool, _, _ *limitBuffer, started func()) (Result, error) {
+		started()
+		return Result{}, nil
+	})
+	manager.runner.cfg.ExecMaxJobs = 2
+	now := time.Now()
+	manager.now = func() time.Time { return now }
+
+	first, err := manager.Start("client", Request{Argv: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitJob(t, manager, "client", first.ID, JobSucceeded)
+	now = now.Add(time.Second)
+	second, err := manager.Start("client", Request{Argv: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitJob(t, manager, "client", second.ID, JobSucceeded)
+
+	// Both slots hold finished jobs well inside the TTL; a third start must
+	// still succeed by evicting the oldest finished job.
+	now = now.Add(time.Second)
+	third, err := manager.Start("client", Request{Argv: []string{"true"}})
+	if err != nil {
+		t.Fatalf("start with only finished jobs retained: %v", err)
+	}
+	waitJob(t, manager, "client", third.ID, JobSucceeded)
+	if _, err := manager.Status("client", first.ID, 0, 0); err == nil {
+		t.Fatal("oldest finished job was not evicted")
+	}
+	if _, err := manager.Status("client", second.ID, 0, 0); err != nil {
+		t.Fatalf("newer finished job evicted: %v", err)
+	}
+}
+
 func TestJobsEvictsExpiredCompletedJobs(t *testing.T) {
 	t.Parallel()
 

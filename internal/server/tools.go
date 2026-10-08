@@ -126,7 +126,7 @@ type capabilitiesResult struct {
 	// ExecNetwork reports whether sandboxed exec commands get a private network
 	// (slirp4netns). It does not restrict LAN, RFC1918 or link-local addresses.
 	ExecNetwork bool `json:"exec_network"`
-	// GitCredentialMode is the mode name only ("none", "ssh", "https"), never paths.
+	// GitCredentialMode is the mode name only ("none", "ssh_key", "https_token"), never paths.
 	GitCredentialMode string `json:"git_credential_mode,omitempty"`
 	Limits            struct {
 		MaxFileBytes  int `json:"max_file_bytes"`

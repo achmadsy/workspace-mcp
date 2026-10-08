@@ -173,6 +173,29 @@ func TestApplyPatchPrevalidatesAllFiles(t *testing.T) {
 	}
 }
 
+func TestApplyPatchZeroContextHunks(t *testing.T) {
+	r, dir := testRoot(t)
+	mustWrite(t, dir, "a.txt", "one\ntwo\nthree\n")
+
+	// `diff -U0` style pure insertion after line 1.
+	if _, err := r.ApplyPatch("--- a/a.txt\n+++ b/a.txt\n@@ -1,0 +2 @@\n+one-and-a-half\n"); err != nil {
+		t.Fatalf("pure insertion rejected: %v", err)
+	}
+	got, _ := r.Read("a.txt")
+	if got.Content != "one\none-and-a-half\ntwo\nthree\n" {
+		t.Fatalf("after insertion = %q", got.Content)
+	}
+
+	// `diff -U0` style pure deletion of the last line.
+	if _, err := r.ApplyPatch("--- a/a.txt\n+++ b/a.txt\n@@ -4 +3,0 @@\n-three\n"); err != nil {
+		t.Fatalf("pure deletion rejected: %v", err)
+	}
+	got, _ = r.Read("a.txt")
+	if got.Content != "one\none-and-a-half\ntwo\n" {
+		t.Fatalf("after deletion = %q", got.Content)
+	}
+}
+
 func TestApplyPatchRejectsUnsafeOperations(t *testing.T) {
 	r, dir := testRoot(t)
 	mustWrite(t, dir, "a.txt", "one\n")
