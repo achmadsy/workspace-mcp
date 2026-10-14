@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -128,7 +129,7 @@ func fullFlow(t *testing.T, ts *httptest.Server, clientID, redirect string) (cod
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 302 || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
+	if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
 		t.Fatalf("login redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
 	// GET consent for fresh CSRF, POST consent.
@@ -146,6 +147,9 @@ func fullFlow(t *testing.T, ts *httptest.Server, clientID, redirect string) (cod
 	}
 	resp.Body.Close()
 	t.Logf("consent POST: %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("consent POST status %d, want 303", resp.StatusCode)
+	}
 	loc = resp.Header.Get("Location")
 	gotRedirect, err := url.Parse(loc)
 	if err != nil {
@@ -570,7 +574,7 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 302 || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
+	if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
 		t.Fatalf("login redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
 
@@ -648,5 +652,230 @@ func TestAttemptLimiter(t *testing.T) {
 	}
 	if !l.allow("other", now) {
 		t.Fatal("other key must pass")
+	}
+}
+
+// beginConsent drives authorize and login, returning an authenticated client
+// plus fresh consent CSRF and request ID.
+func beginConsent(t *testing.T, ts *httptest.Server, clientID, redirect string) (*http.Client, string, string) {
+	t.Helper()
+	_, challenge := pkcePair(t)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirect},
+		"resource":              {testURL},
+		"scope":                 {"workspace"},
+		"state":                 {"st123"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	jar := &simpleJar{}
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Get(ts.URL + "/authorize?" + q.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound || !strings.HasPrefix(resp.Header.Get("Location"), "/login") {
+		t.Fatalf("authorize redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	loc := resp.Header.Get("Location")
+	resp, err = client.Get(ts.URL + loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readAll(t, resp.Body)
+	resp.Body.Close()
+	csrf := extractCSRF(t, body)
+	reqID := queryOf(loc).Get("request")
+	resp, err = client.PostForm(ts.URL+"/login", url.Values{"password": {"correct horse"}, "csrf": {csrf}, "request": {reqID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/consent") {
+		t.Fatalf("login redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	consentLoc := resp.Header.Get("Location")
+	resp, err = client.Get(ts.URL + consentLoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = readAll(t, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("consent page: %d", resp.StatusCode)
+	}
+	return client, extractCSRF(t, body), queryOf(consentLoc).Get("request")
+}
+
+func postConsent(t *testing.T, client *http.Client, ts *httptest.Server, csrf, reqID string) (int, string) {
+	t.Helper()
+	resp, err := client.PostForm(ts.URL+"/consent", url.Values{"csrf": {csrf}, "request": {reqID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Location")
+}
+
+func countGrants(t *testing.T, s *Server) int {
+	t.Helper()
+	n := 0
+	_ = s.store.view(func(st *state) error { n = len(st.Codes); return nil })
+	return n
+}
+
+func TestGeminiCallbackFlow(t *testing.T) {
+	s, ts := testServer(t)
+	redirect := "https://gemini.google.com/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	code := fullFlow(t, ts, clientID, redirect)
+	if code == "" {
+		t.Fatal("no code issued")
+	}
+	verifier := strings.Repeat("v", 64)
+	status, out := exchange(t, ts, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "client_id": {clientID},
+		"redirect_uri": {redirect}, "resource": {testURL}, "code_verifier": {verifier},
+	})
+	if status != 200 || out["access_token"] == "" {
+		t.Fatalf("gemini token exchange: %d %v", status, out)
+	}
+	if _, err := s.VerifyToken(t.Context(), out["access_token"].(string), nil); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestConsentPostsUseSeeOther(t *testing.T) {
+	_, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
+	status, loc := postConsent(t, client, ts, csrf, reqID)
+	if status != http.StatusSeeOther {
+		t.Fatalf("consent POST status %d, want 303", status)
+	}
+	if got, err := url.Parse(loc); err != nil || got.Scheme != "https" || got.Host != "claude.ai" || got.Query().Get("code") == "" {
+		t.Fatalf("consent redirect %q is not the client callback with a code", loc)
+	}
+}
+
+func TestDuplicateConsentReturnsSameLocation(t *testing.T) {
+	s, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
+	firstStatus, firstLoc := postConsent(t, client, ts, csrf, reqID)
+	secondStatus, secondLoc := postConsent(t, client, ts, csrf, reqID)
+	if firstStatus != http.StatusSeeOther || secondStatus != http.StatusSeeOther {
+		t.Fatalf("duplicate consent statuses %d, %d; want 303, 303", firstStatus, secondStatus)
+	}
+	if firstLoc == "" || firstLoc != secondLoc {
+		t.Fatalf("duplicate consent must return identical Location, got %q and %q", firstLoc, secondLoc)
+	}
+	if n := countGrants(t, s); n != 1 {
+		t.Fatalf("duplicate consent issued %d grants, want 1", n)
+	}
+}
+
+func TestConcurrentConsentIssuesOneGrant(t *testing.T) {
+	s, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
+	cookies := jarCookies(client, ts.URL)
+	const workers = 8
+	statuses := make([]int, workers)
+	locations := make([]string, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c := &http.Client{Jar: &simpleJar{cookies: cookies}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			status, loc := postConsent(t, c, ts, csrf, reqID)
+			statuses[i], locations[i] = status, loc
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < workers; i++ {
+		if statuses[i] != http.StatusSeeOther {
+			t.Fatalf("worker %d status %d, want 303", i, statuses[i])
+		}
+		if locations[i] == "" || locations[i] != locations[0] {
+			t.Fatalf("worker %d location %q differs from %q", i, locations[i], locations[0])
+		}
+	}
+	if n := countGrants(t, s); n != 1 {
+		t.Fatalf("concurrent consent issued %d grants, want 1", n)
+	}
+}
+
+func jarCookies(client *http.Client, rawURL string) []*http.Cookie {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	return append([]*http.Cookie(nil), client.Jar.Cookies(u)...)
+}
+
+func TestConsentRetryAfterExchangeIsInvalid(t *testing.T) {
+	_, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
+	_, loc := postConsent(t, client, ts, csrf, reqID)
+	code := queryOf(loc).Get("code")
+	if code == "" {
+		t.Fatalf("no code in %q", loc)
+	}
+	verifier := strings.Repeat("v", 64)
+	if status, _ := exchange(t, ts, url.Values{
+		"grant_type": {"authorization_code"}, "code": {code}, "client_id": {clientID},
+		"redirect_uri": {redirect}, "resource": {testURL}, "code_verifier": {verifier},
+	}); status != 200 {
+		t.Fatalf("exchange: %d", status)
+	}
+	resp, err := client.PostForm(ts.URL+"/consent", url.Values{"csrf": {csrf}, "request": {reqID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("retry after redemption must be invalid_request (400), got %d", resp.StatusCode)
+	}
+	if body := readAll(t, resp.Body); !strings.Contains(body, "invalid_request") {
+		t.Fatalf("retry after redemption must report invalid_request, got %q", body)
+	}
+}
+
+func TestExpiredConsentStaysInvalid(t *testing.T) {
+	s, ts := testServer(t)
+	redirect := "https://claude.ai/api/mcp/auth_callback"
+	clientID := dcrWithRedirect(t, ts, redirect)
+	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
+	if err := s.store.update(func(st *state) error {
+		p := st.Pending[reqID]
+		p.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+		st.Pending[reqID] = p
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := client.PostForm(ts.URL+"/consent", url.Values{"csrf": {csrf}, "request": {reqID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := readAll(t, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 400 || !strings.Contains(body, "invalid_request") {
+			t.Fatalf("expired consent attempt %d: %d %q, want 400 invalid_request", i, resp.StatusCode, body)
+		}
+	}
+	if n := countGrants(t, s); n != 0 {
+		t.Fatalf("expired consent issued %d grants, want 0", n)
 	}
 }

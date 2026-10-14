@@ -21,10 +21,17 @@ type Client struct {
 type PendingAuthorization struct {
 	ID, ClientID, RedirectURI, Resource, Scope, State, CodeChallenge string
 	CreatedAt, ExpiresAt                                             time.Time
+	// CodeHash and Location record the issued retry marker once consent POST
+	// succeeds. Encrypted state compatibility is unchanged: old records simply
+	// leave both empty and still expire as invalid_request.
+	CodeHash, Location string
 }
 type CodeGrant struct {
 	Hash, ClientID, RedirectURI, Resource, Scope, CodeChallenge string
 	ExpiresAt                                                   time.Time
+	// PendingID links the grant back to its authorization request so code
+	// exchange can atomically clear the matching retry marker.
+	PendingID string
 }
 type BrowserSession struct {
 	Hash, CSRF                     string

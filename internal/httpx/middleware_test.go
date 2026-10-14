@@ -16,7 +16,7 @@ func TestOriginValidation(t *testing.T) {
 	h := Harden(passthrough(), Config{
 		PublicOrigin:   "https://mcp.example.com",
 		OriginPaths:    []string{"/mcp", "/logout"},
-		AllowedOrigins: []string{"https://claude.ai", "https://claude.com"},
+		AllowedOrigins: []string{"https://claude.ai", "https://claude.com", "https://gemini.google.com", "https://chatgpt.com", "https://www.kimi.com", "https://chat.qwen.ai", "https://chat.z.ai"},
 	})
 	tests := []struct {
 		name   string
@@ -30,6 +30,16 @@ func TestOriginValidation(t *testing.T) {
 		{name: "claude.ai MCP origin", path: "/mcp", origin: "https://claude.ai", want: 200},
 		{name: "claude.ai default port", path: "/mcp", origin: "https://claude.ai:443", want: 200},
 		{name: "claude.com MCP origin", path: "/mcp", origin: "https://claude.com", want: 200},
+		{name: "gemini MCP origin", path: "/mcp", origin: "https://gemini.google.com", want: 200},
+		{name: "chatgpt MCP origin", path: "/mcp", origin: "https://chatgpt.com", want: 200},
+		{name: "kimi MCP origin", path: "/mcp", origin: "https://www.kimi.com", want: 200},
+		{name: "qwen MCP origin", path: "/mcp", origin: "https://chat.qwen.ai", want: 200},
+		{name: "z.ai MCP origin", path: "/mcp", origin: "https://chat.z.ai", want: 200},
+		{name: "gemini lookalike", path: "/mcp", origin: "https://gemini.google.com.evil.example.com", want: 403},
+		{name: "chatgpt lookalike", path: "/mcp", origin: "https://evil-chatgpt.com", want: 403},
+		{name: "kimi bare domain", path: "/mcp", origin: "https://kimi.com", want: 403},
+		{name: "qwen lookalike", path: "/mcp", origin: "https://chat.qwen.ai.evil.example.com", want: 403},
+		{name: "z.ai lookalike", path: "/mcp", origin: "https://evil-chat.z.ai", want: 403},
 		{name: "public origin default port", path: "/mcp", origin: "https://mcp.example.com:443", want: 200},
 		{name: "claude.ai custom port", path: "/mcp", origin: "https://claude.ai:8443", want: 403},
 		{name: "lookalike MCP origin", path: "/mcp", origin: "https://evil-claude.ai", want: 403},

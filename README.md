@@ -302,6 +302,19 @@ reachable. Optional services: `deploy/systemd/workspace-mcp.service` (expects
 
 ### Claude.ai connector setup
 
+This server also accepts connectors from other remote MCP clients whose exact
+origin is allow-listed: `https://claude.ai`, `https://claude.com`,
+`https://gemini.google.com`, `https://chatgpt.com`, `https://www.kimi.com`,
+`https://chat.qwen.ai`, and `https://chat.z.ai`. Matching is exact (canonical
+origin comparison, no wildcards), so lookalikes such as
+`https://gemini.google.com.evil.example.com`, `https://evil-chatgpt.com`, or
+`https://kimi.com` are rejected with `403 "forbidden origin"`.
+
+Set `MCP_ALLOWED_ORIGINS` to a comma-separated list to replace these defaults
+entirely (for example
+`MCP_ALLOWED_ORIGINS=https://claude.ai, https://example.example.com`). An
+empty value keeps the defaults.
+
 1. Start the server + tunnel; note the exact public URL ending in `/mcp`.
 2. claude.ai → **Settings → Connectors → Add custom connector**.
 3. Paste the **full URL including `/mcp`** (e.g.
@@ -342,8 +355,8 @@ configuration fails closed before agentic startup; safe-profile tests still run.
 | Claude: "Authorization with the MCP server failed" | Wrong password, stale consent, or changed URL. Re-add the connector; each new Quick Tunnel URL resets all tokens. |
 | Tool calls fail after tunnel restart | Expected with Quick Tunnels — re-add connector with the new URL. |
 | `git_status` says "not a Git repository" | The workspace has no `.git`; run `git init` if intended. |
-| 403 "forbidden origin" on `/mcp` | A browser sent a mismatched `Origin`; the public origin must equal `MCP_PUBLIC_URL`'s origin. OAuth login and consent use CSRF tokens and are not subject to this MCP endpoint check. |
-| Login or consent form fails | Password, expired browser session, or CSRF validation failed. Restart the authorization flow from the connector. |
+| 403 "forbidden origin" on `/mcp` | A browser sent a mismatched `Origin`; the public origin must equal `MCP_PUBLIC_URL`'s origin, and remote MCP clients must exactly match `MCP_ALLOWED_ORIGINS` (defaults include `https://gemini.google.com`, `https://chatgpt.com`, `https://www.kimi.com`, `https://chat.qwen.ai`, and `https://chat.z.ai`; setting the variable replaces the defaults). OAuth login and consent use CSRF tokens and are not subject to this MCP endpoint check. |
+| Login or consent form fails | Password, expired browser session, or CSRF validation failed. Successful login and consent POSTs answer `303`; retrying consent before token exchange returns the same callback URL. After code exchange, or when the request expired, retrying consent returns `invalid_request`. Restart the authorization flow from the connector. |
 | 429 responses | Rate limiting (300 req/min per IP); check for tight client retry loops. |
 | WSL2: service not running after Windows restart | Enable systemd in `/etc/wsl.conf` or add the start command to logon automation. |
 | Agentic startup says helper unavailable | Install `bubblewrap`, `slirp4netns`, and `util-linux` (`prlimit`), then verify user namespaces and `systemd-run --user --scope -- /bin/true`. |

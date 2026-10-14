@@ -59,6 +59,13 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request) {
 			return errors.New("code replay")
 		}
 		delete(st.Codes, h)
+		if g.PendingID != "" {
+			// Successful exchange ends the retry window: drop the matching
+			// pending marker so a later duplicate POST is invalid_request.
+			if pending, exists := st.Pending[g.PendingID]; exists && pending.CodeHash == h {
+				delete(st.Pending, g.PendingID)
+			}
+		}
 		st.Access[hashToken(access)] = TokenRecord{Hash: hashToken(access), ClientID: g.ClientID, Resource: g.Resource, Scope: g.Scope, Family: family, ExpiresAt: now.Add(limits.AccessTokenTTL)}
 		st.Refresh[hashToken(refresh)] = RefreshRecord{Hash: hashToken(refresh), ClientID: g.ClientID, Resource: g.Resource, Scope: g.Scope, Family: family, ExpiresAt: now.Add(limits.RefreshTokenTTL)}
 		return nil

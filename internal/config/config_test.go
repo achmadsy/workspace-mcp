@@ -91,8 +91,14 @@ func TestPublicModeRequires(t *testing.T) {
 		t.Fatalf("origin: %q", c.Origin())
 	}
 	// Default client origins for remote MCP connectors.
-	if len(c.AllowedOrigins) != 2 || c.AllowedOrigins[0] != "https://claude.ai" || c.AllowedOrigins[1] != "https://claude.com" {
+	wantDefaults := []string{"https://claude.ai", "https://claude.com", "https://gemini.google.com", "https://chatgpt.com", "https://www.kimi.com", "https://chat.qwen.ai", "https://chat.z.ai"}
+	if len(c.AllowedOrigins) != len(wantDefaults) {
 		t.Fatalf("default allowed origins: %q", c.AllowedOrigins)
+	}
+	for i, want := range wantDefaults {
+		if c.AllowedOrigins[i] != want {
+			t.Fatalf("default allowed origins: %q", c.AllowedOrigins)
+		}
 	}
 	// Explicit override replaces defaults; trailing slashes trimmed.
 	setEnv(t, map[string]string{"MCP_ALLOWED_ORIGINS": "https://claude.ai/, https://other.example.com ,"})
@@ -109,7 +115,7 @@ func TestPublicModeRequires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty allowed origins: %v", err)
 	}
-	if len(c.AllowedOrigins) != 2 {
+	if len(c.AllowedOrigins) != len(wantDefaults) {
 		t.Fatalf("empty override must use defaults: %q", c.AllowedOrigins)
 	}
 	env["MCP_STATE_KEY"] = base64.StdEncoding.EncodeToString(make([]byte, 16))

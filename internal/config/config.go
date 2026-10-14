@@ -111,9 +111,10 @@ func Load() (Config, error) {
 			c.GitAllowedRemotes = append(c.GitAllowedRemotes, remote)
 		}
 	}
-	// Remote MCP clients (Claude.ai connectors) call /mcp server-side with
-	// their own Origin header; allow-list them instead of rejecting 403.
-	c.AllowedOrigins = []string{"https://claude.ai", "https://claude.com"}
+	// Remote MCP clients call /mcp server-side with their own Origin header;
+	// allow-list them instead of rejecting 403. Exact origins only, no wildcards.
+	// MCP_ALLOWED_ORIGINS, when set, replaces these defaults entirely.
+	c.AllowedOrigins = []string{"https://claude.ai", "https://claude.com", "https://gemini.google.com", "https://chatgpt.com", "https://www.kimi.com", "https://chat.qwen.ai", "https://chat.z.ai"}
 	if raw := strings.TrimSpace(os.Getenv("MCP_ALLOWED_ORIGINS")); raw != "" {
 		c.AllowedOrigins = nil
 		for _, part := range strings.Split(raw, ",") {

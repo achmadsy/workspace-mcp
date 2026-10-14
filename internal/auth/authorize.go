@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,6 +11,11 @@ import (
 
 	"github.com/link/workspace-mcp/internal/limits"
 	"golang.org/x/crypto/argon2"
+)
+
+var (
+	errAuthorizationExpired = errors.New("authorization request expired")
+	errAuthorizationGranted = errors.New("authorization already granted")
 )
 
 type pageData struct {
@@ -93,7 +99,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			sess.Authenticated = true
 			sess.LastSeen = time.Now().UTC()
 			_ = s.store.update(func(st *state) error { st.Sessions[sess.Hash] = sess; return nil })
-			http.Redirect(w, r, "/consent?request="+url.QueryEscape(id), http.StatusFound)
+			http.Redirect(w, r, "/consent?request="+url.QueryEscape(id), http.StatusSeeOther)
 			return
 		}
 		render(w, pageData{Title: "Workspace MCP login", Message: "Invalid password", Action: "/login", CSRF: sess.CSRF, Request: id, Button: "Sign in", Password: true})
@@ -113,7 +119,7 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !sess.Authenticated {
-		http.Redirect(w, r, "/login?request="+url.QueryEscape(r.URL.Query().Get("request")), 302)
+		http.Redirect(w, r, "/login?request="+url.QueryEscape(r.URL.Query().Get("request")), http.StatusFound)
 		return
 	}
 	id := r.URL.Query().Get("request")
@@ -130,29 +136,64 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		var p PendingAuthorization
 		ok := false
 		_ = s.store.view(func(st *state) error { p, ok = st.Pending[id]; return nil })
-		if !ok || time.Now().After(p.ExpiresAt) {
+		if !ok || time.Now().UTC().After(p.ExpiresAt) {
 			oauthError(w, 400, "invalid_request", "authorization request expired")
 			return
 		}
-		code, _ := randomToken()
-		grant := CodeGrant{Hash: hashToken(code), ClientID: p.ClientID, RedirectURI: p.RedirectURI, Resource: p.Resource, Scope: p.Scope, CodeChallenge: p.CodeChallenge, ExpiresAt: time.Now().UTC().Add(limits.AuthorizationTTL)}
-		if err := s.store.update(func(st *state) error {
-			delete(st.Pending, id)
-			st.Codes[grant.Hash] = grant
-			st.Consents[p.ClientID+"|"+p.Resource] = true
-			return nil
-		}); err != nil {
+		if p.Location != "" {
+			// Retry-safe: a grant already exists for this request, so return the
+			// identical callback Location without issuing a second grant.
+			http.Redirect(w, r, p.Location, http.StatusSeeOther)
+			return
+		}
+		code, err := randomToken()
+		if err != nil {
 			http.Error(w, "consent failed", 500)
 			return
 		}
-		u, _ := url.Parse(p.RedirectURI)
+		u, err := url.Parse(p.RedirectURI)
+		if err != nil {
+			oauthError(w, 400, "invalid_request", "authorization request expired")
+			return
+		}
 		q := u.Query()
 		q.Set("code", code)
 		if p.State != "" {
 			q.Set("state", p.State)
 		}
 		u.RawQuery = q.Encode()
-		http.Redirect(w, r, u.String(), 302)
+		location := u.String()
+		codeHash := hashToken(code)
+		grant := CodeGrant{Hash: codeHash, ClientID: p.ClientID, RedirectURI: p.RedirectURI, Resource: p.Resource, Scope: p.Scope, CodeChallenge: p.CodeChallenge, ExpiresAt: time.Now().UTC().Add(limits.AuthorizationTTL), PendingID: id}
+		err = s.store.update(func(st *state) error {
+			current, exists := st.Pending[id]
+			if !exists || time.Now().UTC().After(current.ExpiresAt) {
+				return errAuthorizationExpired
+			}
+			if current.Location != "" {
+				location = current.Location
+				return errAuthorizationGranted
+			}
+			current.CodeHash = codeHash
+			current.Location = location
+			st.Pending[id] = current
+			st.Codes[codeHash] = grant
+			st.Consents[current.ClientID+"|"+current.Resource] = true
+			return nil
+		})
+		if errors.Is(err, errAuthorizationGranted) {
+			http.Redirect(w, r, location, http.StatusSeeOther)
+			return
+		}
+		if errors.Is(err, errAuthorizationExpired) {
+			oauthError(w, 400, "invalid_request", "authorization request expired")
+			return
+		}
+		if err != nil {
+			http.Error(w, "consent failed", 500)
+			return
+		}
+		http.Redirect(w, r, location, http.StatusSeeOther)
 		return
 	}
 	if r.Method != http.MethodGet {
