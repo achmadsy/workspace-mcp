@@ -21,10 +21,9 @@ var (
 type pageData struct {
 	Title, Message, Action, CSRF, Request, Button string
 	Password                                      bool
-	// FormActionOrigin, when set, is added to form-action for the
-	// cross-origin redirect that follows consent (the OAuth client
-	// callback). Empty keeps the policy self-only.
-	FormActionOrigin string
+	// FormActionOrigins are exact origins permitted for form submission and
+	// redirects that follow it. Empty keeps the policy self-only.
+	FormActionOrigins []string
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
@@ -102,14 +101,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/consent?request="+url.QueryEscape(id), http.StatusSeeOther)
 			return
 		}
-		render(w, pageData{Title: "Workspace MCP login", Message: "Invalid password", Action: "/login", CSRF: sess.CSRF, Request: id, Button: "Sign in", Password: true})
+		render(w, pageData{Title: "Workspace MCP login", Message: "Invalid password", Action: "/login", CSRF: sess.CSRF, Request: id, Button: "Sign in", Password: true, FormActionOrigins: []string{s.origin}})
 		return
 	}
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, "GET, POST")
 		return
 	}
-	render(w, pageData{Title: "Workspace MCP login", Action: "/login", CSRF: sess.CSRF, Request: id, Button: "Sign in", Password: true})
+	render(w, pageData{Title: "Workspace MCP login", Action: "/login", CSRF: sess.CSRF, Request: id, Button: "Sign in", Password: true, FormActionOrigins: []string{s.origin}})
 }
 
 func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +213,7 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		host = u.Host
 		callbackOrigin = u.Scheme + "://" + u.Host
 	}
-	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigin: callbackOrigin})
+	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigins: []string{s.origin, callbackOrigin}})
 }
 
 func subtleCompare(a, b []byte) bool {

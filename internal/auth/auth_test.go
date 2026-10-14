@@ -563,8 +563,8 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	loginCSP := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(loginCSP, "form-action 'self'") || strings.Contains(loginCSP, "claude.ai") {
-		t.Fatalf("login CSP must stay self-only: %q", loginCSP)
+	if !strings.Contains(loginCSP, "form-action 'self' https://mcp.example.com") || strings.Contains(loginCSP, "claude.ai") {
+		t.Fatalf("login CSP must allow only self and the explicit server origin: %q", loginCSP)
 	}
 	loginBody := readAll(t, resp.Body)
 	resp.Body.Close()
@@ -605,8 +605,8 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	consentCSP := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(consentCSP, "form-action 'self' https://connect.example.com:8443") {
-		t.Fatalf("consent CSP must allow registered callback origin: %q", consentCSP)
+	if !strings.Contains(consentCSP, "form-action 'self' https://mcp.example.com https://connect.example.com:8443") {
+		t.Fatalf("consent CSP must allow server and registered callback origins: %q", consentCSP)
 	}
 	if strings.Contains(consentCSP, "claude.ai") {
 		t.Fatalf("consent CSP must not allow unrelated callbacks: %q", consentCSP)
@@ -729,7 +729,7 @@ func countGrants(t *testing.T, s *Server) int {
 
 func TestGeminiCallbackFlow(t *testing.T) {
 	s, ts := testServer(t)
-	redirect := "https://gemini.google.com/api/mcp/auth_callback"
+	redirect := "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test"
 	clientID := dcrWithRedirect(t, ts, redirect)
 	code := fullFlow(t, ts, clientID, redirect)
 	if code == "" {

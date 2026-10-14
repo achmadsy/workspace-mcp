@@ -48,8 +48,10 @@ func render(w http.ResponseWriter, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	formAction := "form-action 'self'"
-	if data.FormActionOrigin != "" {
-		formAction += " " + data.FormActionOrigin
+	for _, origin := range data.FormActionOrigins {
+		if origin != "" {
+			formAction += " " + origin
+		}
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; "+formAction+"; base-uri 'none'; frame-ancestors 'none'")
 	if err := page.Execute(w, data); err != nil {
