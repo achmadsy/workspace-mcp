@@ -563,7 +563,7 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	loginCSP := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(loginCSP, "form-action 'self' https://mcp.example.com") || strings.Contains(loginCSP, "claude.ai") {
+	if !strings.Contains(loginCSP, "form-action 'self' https://mcp.example.com") || strings.Contains(loginCSP, "unsafe-allow-redirects") || strings.Contains(loginCSP, "claude.ai") {
 		t.Fatalf("login CSP must allow only self and the explicit server origin: %q", loginCSP)
 	}
 	loginBody := readAll(t, resp.Body)
@@ -605,8 +605,8 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	consentCSP := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(consentCSP, "form-action 'self' https://mcp.example.com https://connect.example.com:8443") {
-		t.Fatalf("consent CSP must allow server and registered callback origins: %q", consentCSP)
+	if !strings.Contains(consentCSP, "form-action 'self' https://mcp.example.com https://connect.example.com:8443 'unsafe-allow-redirects'") {
+		t.Fatalf("consent CSP must allow server, registered callback, and its redirect chain: %q", consentCSP)
 	}
 	if strings.Contains(consentCSP, "claude.ai") {
 		t.Fatalf("consent CSP must not allow unrelated callbacks: %q", consentCSP)

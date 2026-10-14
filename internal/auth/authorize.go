@@ -21,9 +21,10 @@ var (
 type pageData struct {
 	Title, Message, Action, CSRF, Request, Button string
 	Password                                      bool
-	// FormActionOrigins are exact origins permitted for form submission and
-	// redirects that follow it. Empty keeps the policy self-only.
-	FormActionOrigins []string
+	// FormActionOrigins are exact origins permitted for form submission.
+	// AllowFormRedirects permits the registered OAuth callback redirect chain.
+	FormActionOrigins  []string
+	AllowFormRedirects bool
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +214,7 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		host = u.Host
 		callbackOrigin = u.Scheme + "://" + u.Host
 	}
-	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigins: []string{s.origin, callbackOrigin}})
+	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigins: []string{s.origin, callbackOrigin}, AllowFormRedirects: true})
 }
 
 func subtleCompare(a, b []byte) bool {

@@ -53,6 +53,9 @@ func render(w http.ResponseWriter, data pageData) {
 			formAction += " " + origin
 		}
 	}
+	if data.AllowFormRedirects {
+		formAction += " 'unsafe-allow-redirects'"
+	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; "+formAction+"; base-uri 'none'; frame-ancestors 'none'")
 	if err := page.Execute(w, data); err != nil {
 		http.Error(w, "render failed", 500)
