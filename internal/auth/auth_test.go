@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -145,12 +146,13 @@ func fullFlow(t *testing.T, ts *httptest.Server, clientID, redirect string) (cod
 	if err != nil {
 		t.Fatal(err)
 	}
+	body = readAll(t, resp.Body)
 	resp.Body.Close()
-	t.Logf("consent POST: %d %q", resp.StatusCode, resp.Header.Get("Location"))
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("consent POST status %d, want 303", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Location") != "" {
+		t.Fatalf("consent POST status %d Location %q, want 200 without redirect", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	loc = resp.Header.Get("Location")
+	loc = extractCompletionLocation(t, body)
+	t.Logf("consent completion: %d %q", resp.StatusCode, loc)
 	gotRedirect, err := url.Parse(loc)
 	if err != nil {
 		t.Fatalf("parse redirect location: %v", err)
@@ -177,6 +179,28 @@ func readAll(t *testing.T, r interface{ Read([]byte) (int, error) }) string {
 	buf := make([]byte, 65536)
 	n, _ := r.Read(buf)
 	return string(buf[:n])
+}
+
+func extractCompletionLocation(t *testing.T, body string) string {
+	t.Helper()
+	extract := func(marker string) string {
+		i := strings.Index(body, marker)
+		if i < 0 {
+			t.Fatalf("completion target %q not found in %q", marker, body[:min(len(body), 500)])
+		}
+		rest := body[i+len(marker):]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			t.Fatalf("completion target %q is malformed in %q", marker, body[:min(len(body), 500)])
+		}
+		return html.UnescapeString(rest[:j])
+	}
+	refresh := extract(`<meta http-equiv="refresh" content="0;url=`)
+	link := extract(`<a href="`)
+	if refresh != link {
+		t.Fatalf("completion targets differ: meta refresh %q, link %q", refresh, link)
+	}
+	return link
 }
 
 func extractCSRF(t *testing.T, body string) string {
@@ -605,8 +629,8 @@ func TestConsentAllowsRegisteredCallbackInCSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	consentCSP := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(consentCSP, "form-action 'self' https://mcp.example.com https://connect.example.com:8443 'unsafe-allow-redirects'") {
-		t.Fatalf("consent CSP must allow server, registered callback, and its redirect chain: %q", consentCSP)
+	if !strings.Contains(consentCSP, "form-action 'self' https://mcp.example.com") || strings.Contains(consentCSP, "connect.example.com") || strings.Contains(consentCSP, "unsafe-allow-redirects") {
+		t.Fatalf("consent CSP must allow only self and the explicit server origin: %q", consentCSP)
 	}
 	if strings.Contains(consentCSP, "claude.ai") {
 		t.Fatalf("consent CSP must not allow unrelated callbacks: %q", consentCSP)
@@ -717,7 +741,27 @@ func postConsent(t *testing.T, client *http.Client, ts *httptest.Server, csrf, r
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode, resp.Header.Get("Location")
+	body := readAll(t, resp.Body)
+	if resp.Header.Get("Location") != "" {
+		t.Fatalf("consent completion must not use an HTTP redirect: %q", resp.Header.Get("Location"))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, ""
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":          "no-store",
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := resp.Header.Get(name); got != want {
+			t.Fatalf("completion %s = %q, want %q", name, got, want)
+		}
+	}
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("completion CSP is not restrictive: %q", csp)
+	}
+	return resp.StatusCode, extractCompletionLocation(t, body)
 }
 
 func countGrants(t *testing.T, s *Server) int {
@@ -748,14 +792,14 @@ func TestGeminiCallbackFlow(t *testing.T) {
 	}
 }
 
-func TestConsentPostsUseSeeOther(t *testing.T) {
+func TestConsentPostRendersCompletionPage(t *testing.T) {
 	_, ts := testServer(t)
 	redirect := "https://claude.ai/api/mcp/auth_callback"
 	clientID := dcrWithRedirect(t, ts, redirect)
 	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
 	status, loc := postConsent(t, client, ts, csrf, reqID)
-	if status != http.StatusSeeOther {
-		t.Fatalf("consent POST status %d, want 303", status)
+	if status != http.StatusOK {
+		t.Fatalf("consent POST status %d, want 200", status)
 	}
 	if got, err := url.Parse(loc); err != nil || got.Scheme != "https" || got.Host != "claude.ai" || got.Query().Get("code") == "" {
 		t.Fatalf("consent redirect %q is not the client callback with a code", loc)
@@ -769,8 +813,8 @@ func TestDuplicateConsentReturnsSameLocation(t *testing.T) {
 	client, csrf, reqID := beginConsent(t, ts, clientID, redirect)
 	firstStatus, firstLoc := postConsent(t, client, ts, csrf, reqID)
 	secondStatus, secondLoc := postConsent(t, client, ts, csrf, reqID)
-	if firstStatus != http.StatusSeeOther || secondStatus != http.StatusSeeOther {
-		t.Fatalf("duplicate consent statuses %d, %d; want 303, 303", firstStatus, secondStatus)
+	if firstStatus != http.StatusOK || secondStatus != http.StatusOK {
+		t.Fatalf("duplicate consent statuses %d, %d; want 200, 200", firstStatus, secondStatus)
 	}
 	if firstLoc == "" || firstLoc != secondLoc {
 		t.Fatalf("duplicate consent must return identical Location, got %q and %q", firstLoc, secondLoc)
@@ -801,8 +845,8 @@ func TestConcurrentConsentIssuesOneGrant(t *testing.T) {
 	}
 	wg.Wait()
 	for i := 0; i < workers; i++ {
-		if statuses[i] != http.StatusSeeOther {
-			t.Fatalf("worker %d status %d, want 303", i, statuses[i])
+		if statuses[i] != http.StatusOK {
+			t.Fatalf("worker %d status %d, want 200", i, statuses[i])
 		}
 		if locations[i] == "" || locations[i] != locations[0] {
 			t.Fatalf("worker %d location %q differs from %q", i, locations[i], locations[0])

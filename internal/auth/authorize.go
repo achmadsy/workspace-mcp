@@ -22,9 +22,7 @@ type pageData struct {
 	Title, Message, Action, CSRF, Request, Button string
 	Password                                      bool
 	// FormActionOrigins are exact origins permitted for form submission.
-	// AllowFormRedirects permits the registered OAuth callback redirect chain.
-	FormActionOrigins  []string
-	AllowFormRedirects bool
+	FormActionOrigins []string
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
@@ -141,9 +139,9 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if p.Location != "" {
-			// Retry-safe: a grant already exists for this request, so return the
-			// identical callback Location without issuing a second grant.
-			http.Redirect(w, r, p.Location, http.StatusSeeOther)
+			// Retry-safe: a grant already exists for this request, so render the
+			// identical callback without issuing a second grant.
+			renderCompletion(w, p.Location)
 			return
 		}
 		code, err := randomToken()
@@ -182,7 +180,7 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 		if errors.Is(err, errAuthorizationGranted) {
-			http.Redirect(w, r, location, http.StatusSeeOther)
+			renderCompletion(w, location)
 			return
 		}
 		if errors.Is(err, errAuthorizationExpired) {
@@ -193,7 +191,7 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "consent failed", 500)
 			return
 		}
-		http.Redirect(w, r, location, http.StatusSeeOther)
+		renderCompletion(w, location)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -209,12 +207,10 @@ func (s *Server) consent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host := ""
-	callbackOrigin := ""
 	if u, e := url.Parse(p.RedirectURI); e == nil {
 		host = u.Host
-		callbackOrigin = u.Scheme + "://" + u.Host
 	}
-	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigins: []string{s.origin, callbackOrigin}, AllowFormRedirects: true})
+	render(w, pageData{Title: "Authorize workspace access", Message: "Client: " + c.ClientName + "; redirect host: " + host + "; scope: " + p.Scope + "; resource: " + p.Resource, Action: "/consent", CSRF: sess.CSRF, Request: id, Button: "Allow", FormActionOrigins: []string{s.origin}})
 }
 
 func subtleCompare(a, b []byte) bool {

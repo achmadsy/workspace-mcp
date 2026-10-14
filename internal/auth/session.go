@@ -11,7 +11,10 @@ import (
 
 const sessionCookie = "workspace_mcp_session"
 
-var page = template.Must(template.New("page").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{{.Title}}</title></head><body><main><h1>{{.Title}}</h1>{{if .Message}}<p>{{.Message}}</p>{{end}}<form method="post" action="{{.Action}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="request" value="{{.Request}}">{{if .Password}}<label>Password <input type="password" name="password" required autocomplete="current-password"></label>{{end}}<button type="submit">{{.Button}}</button></form></main></body></html>`))
+var (
+	page           = template.Must(template.New("page").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{{.Title}}</title></head><body><main><h1>{{.Title}}</h1>{{if .Message}}<p>{{.Message}}</p>{{end}}<form method="post" action="{{.Action}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="request" value="{{.Request}}">{{if .Password}}<label>Password <input type="password" name="password" required autocomplete="current-password"></label>{{end}}<button type="submit">{{.Button}}</button></form></main></body></html>`))
+	completionPage = template.Must(template.New("completion").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url={{.}}"><title>Authorization complete</title></head><body><main><h1>Authorization complete</h1><p>Continue to finish connecting your workspace.</p><p><a href="{{.}}">Continue</a></p></main></body></html>`))
+)
 
 func (s *Server) ensureSession(w http.ResponseWriter, r *http.Request) (string, BrowserSession, error) {
 	now := time.Now().UTC()
@@ -44,23 +47,38 @@ func (s *Server) ensureSession(w http.ResponseWriter, r *http.Request) (string, 
 func secureEqual(a, b string) bool {
 	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
-func render(w http.ResponseWriter, data pageData) {
+func securePageHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+}
+
+func render(w http.ResponseWriter, data pageData) {
+	securePageHeaders(w)
 	formAction := "form-action 'self'"
 	for _, origin := range data.FormActionOrigins {
 		if origin != "" {
 			formAction += " " + origin
 		}
 	}
-	if data.AllowFormRedirects {
-		formAction += " 'unsafe-allow-redirects'"
-	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; "+formAction+"; base-uri 'none'; frame-ancestors 'none'")
 	if err := page.Execute(w, data); err != nil {
 		http.Error(w, "render failed", 500)
 	}
 }
+
+// renderCompletion changes the callback into a fresh navigation instead of a
+// redirect from the consent form submission, avoiding inconsistent form-action
+// redirect enforcement across browsers.
+func renderCompletion(w http.ResponseWriter, location string) {
+	securePageHeaders(w)
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+	if err := completionPage.Execute(w, location); err != nil {
+		http.Error(w, "render failed", 500)
+	}
+}
+
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, "POST")
