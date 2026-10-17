@@ -368,8 +368,15 @@ if [ ! -e "$CREDENTIAL_FILE" ] || [ "$WRITE_CREDENTIALS" = true ] || [ "$LEGACY_
 fi
 
 "$ROOT/scripts/bootstrap-go.sh"
-GOROOT="$ROOT/.tools/go" PATH="$ROOT/.tools/go/bin:$PATH" \
-  "$ROOT/.tools/go/bin/go" build -o "$ROOT/bin/workspace-mcp" ./cmd/workspace-mcp
+# Build from the repository root, not the caller's current working directory.
+# The launcher is commonly invoked by CAO from another repository; without the
+# subshell `go build ./cmd/workspace-mcp` resolves against that caller and fails
+# with "cannot find main module".
+(
+  cd "$ROOT"
+  GOROOT="$ROOT/.tools/go" PATH="$ROOT/.tools/go/bin:$PATH" \
+    "$ROOT/.tools/go/bin/go" build -o "$ROOT/bin/workspace-mcp" ./cmd/workspace-mcp
+)
 
 TUNNEL_LOG="$(mktemp /tmp/workspace-mcp-tunnel.XXXXXX.log)"
 cleanup() {
